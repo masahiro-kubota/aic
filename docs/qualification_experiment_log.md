@@ -101,3 +101,27 @@ It should stay concise enough to scan quickly.
   - `some TF-based distance scoring is still brittle when the run does not get close enough`
 - Next action:
   - `replace the dev-only SFP target source with a legal center-camera localizer while keeping the same controller phases`
+
+## 2026-03-21 05:38 JST - M2 SFP Center-Camera Localizer
+
+- Commit: `uncommitted`
+- Milestone: `M2`
+- Submission-safe: `yes` for SFP path, `SC hold-only`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=m2_sfp_center`, center-camera SFP visual servo only, headless eval via `/entrypoint.sh`, `ground_truth:=false`
+- Score total: `3`
+- Score by trial: `t1=1`, `t2=1`, `t3=1`
+- Artifacts:
+  - `/home/masa/aic_results/scoring.yaml`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_053809_m2_sfp_center_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_053816_m2_sfp_center_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_053823_m2_sfp_center_task_1`
+- What worked:
+  - `the SFP path no longer uses the development-only world-frame target provider`
+  - `trial_1 SFP feature size grew from roughly 163x73 px at the start to about 255x263 px after localization, showing that the legal localizer moved toward the module`
+  - `SC was isolated behind a hold-only path, so M2 failure modes stayed attributable to the SFP localizer`
+- What failed:
+  - `localization-only is not enough to score yet because there is no insertion phase`
+  - `trial_2 SFP still localizes less cleanly than trial_1`
+- Next action:
+  - `reuse the same M2 localizer in M3, then add a conservative nominal insertion push`

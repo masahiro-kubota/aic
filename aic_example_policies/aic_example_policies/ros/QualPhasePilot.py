@@ -25,6 +25,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from transforms3d._gohlketransforms import quaternion_slerp
+from transforms3d.quaternions import quat2mat
 
 from aic_model.policy import (
     GetObservationCallback,
@@ -36,6 +37,8 @@ from aic_model_interfaces.msg import Observation
 from aic_task_interfaces.msg import Task
 from geometry_msgs.msg import Point, Pose, Quaternion
 from rclpy.duration import Duration
+from rclpy.time import Time
+from tf2_ros import TransformException
 
 
 def _stamp_to_float(stamp) -> float:
@@ -293,6 +296,14 @@ class DebugRun:
 
 
 class QualPhasePilot(Policy):
+    _CENTER_CAMERA_FRAME = "center_camera/optical"
+    _SFP_VISUAL_TEMPLATE = {
+        "union_center_uv": (538.0, 565.0),
+        "union_size_px": (306.0, 332.0),
+        "camera_depth_m": 0.18,
+        "nominal_quat_wxyz": (0.184036, 0.9825145, -0.0277635, -0.0049785),
+    }
+    _SFP_INSERTION_VECTOR_BASE = (0.0, -0.000579, -0.045797)
     _DEV_TARGETS = {
         ("sfp", "nic_card_mount_0", "sfp_port_0"): PhaseTarget(
             entrance_position=(-0.384371, 0.213751, 0.237210),
@@ -499,6 +510,204 @@ class QualPhasePilot(Policy):
         else:
             summary["center_camera"] = {"detector": "none"}
         return summary
+
+    def _lookup_camera_rotation_base_from_optical(self) -> np.ndarray | None:
+        try:
+            transform = self._parent_node._tf_buffer.lookup_transform(
+                "base_link",
+                self._CENTER_CAMERA_FRAME,
+                Time(),
+            )
+        except TransformException as ex:
+            self.get_logger().warn(f"center camera TF lookup failed: {ex}")
+            return None
+        quat_wxyz = (
+            transform.transform.rotation.w,
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+        )
+        return quat2mat(quat_wxyz)
+
+    def _sfp_union_feature(self, observation: Observation | None) -> dict | None:
+        if observation is None:
+            return None
+        center = _image_to_bgr(observation.center_image)
+        hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+        green_mask = cv2.inRange(
+            hsv,
+            np.array([40, 40, 20], dtype=np.uint8),
+            np.array([90, 255, 255], dtype=np.uint8),
+        )
+        components = _mask_components(green_mask, min_area_px=80)
+        components.sort(key=lambda item: item["centroid_uv"][0])
+        union_bbox = _union_bbox(components)
+        feature_summary = {
+            "available": True,
+            "center_camera": {
+                "detector": "green_mask",
+                "component_count": len(components),
+                "components": components,
+                "union_bbox_xywh": union_bbox,
+            },
+        }
+        if union_bbox is None or not components:
+            return None
+        x, y, w, h = union_bbox
+        largest = max(components, key=lambda item: item["area_px"])
+        return {
+            "feature_summary": feature_summary,
+            "union_bbox_xywh": union_bbox,
+            "union_center_uv": (float(x + w / 2.0), float(y + h / 2.0)),
+            "union_size_px": (float(w), float(h)),
+            "largest_component": largest,
+        }
+
+    def _make_pose(
+        self, position_xyz: np.ndarray, quat_wxyz: tuple[float, float, float, float]
+    ) -> Pose:
+        return Pose(
+            position=Point(
+                x=float(position_xyz[0]),
+                y=float(position_xyz[1]),
+                z=float(position_xyz[2]),
+            ),
+            orientation=self._quat_wxyz_to_xyzw(quat_wxyz),
+        )
+
+    def _pose_position(self, pose: Pose) -> np.ndarray:
+        return np.array(
+            [pose.position.x, pose.position.y, pose.position.z],
+            dtype=float,
+        )
+
+    def _run_stage_hold_only(
+        self,
+        stage_note: str,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            observation,
+            {"feature_summary": self._extract_feature_summary(task, observation)},
+        )
+        if observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        send_feedback(stage_note)
+        debug_run.log_phase(
+            "hold",
+            self.time_now().nanoseconds / 1e9,
+            stage_note,
+        )
+        self._hold_pose(
+            move_robot,
+            observation.controller_state.tcp_pose,
+            2.0,
+            debug_run=debug_run,
+            phase_name="hold",
+        )
+        final_observation = get_observation()
+        debug_run.log_phase("done", self.time_now().nanoseconds / 1e9, "hold-only stage")
+        debug_run.finalize(
+            True,
+            "hold-only stage completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"Hold-only artifacts saved to {debug_run.root}")
+        return True
+
+    def _visual_servo_sfp(
+        self,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        phase_name: str,
+        max_steps: int,
+        hold_when_aligned: bool,
+    ) -> tuple[Pose | None, Observation | None, dict | None]:
+        rotation_base_from_optical = self._lookup_camera_rotation_base_from_optical()
+        if rotation_base_from_optical is None:
+            return None, None, None
+
+        desired_u, desired_v = self._SFP_VISUAL_TEMPLATE["union_center_uv"]
+        desired_w, desired_h = self._SFP_VISUAL_TEMPLATE["union_size_px"]
+        desired_quat = self._SFP_VISUAL_TEMPLATE["nominal_quat_wxyz"]
+        nominal_depth = float(self._SFP_VISUAL_TEMPLATE["camera_depth_m"])
+
+        best_observation = None
+        best_feature = None
+        for step in range(max_steps):
+            observation = self._wait_for_observation(get_observation, timeout_sec=1.0)
+            feature = self._sfp_union_feature(observation)
+            if observation is None or feature is None:
+                return None, observation, feature
+
+            best_observation = observation
+            best_feature = feature
+
+            current_pose = observation.controller_state.tcp_pose
+            fx = float(observation.center_camera_info.k[0])
+            fy = float(observation.center_camera_info.k[4])
+            union_u, union_v = feature["union_center_uv"]
+            union_w, union_h = feature["union_size_px"]
+            du = union_u - desired_u
+            dv = union_v - desired_v
+            dh = desired_h - union_h
+
+            aligned = abs(du) < 18.0 and abs(dv) < 18.0 and abs(dh) < 24.0
+            debug_run.log_command_sample(
+                phase_name,
+                current_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"servo step {step + 1}/{max_steps} "
+                    f"du={du:.1f} dv={dv:.1f} dh={dh:.1f}"
+                ),
+            )
+            if aligned:
+                aligned_pose = self._make_pose(self._pose_position(current_pose), desired_quat)
+                self.set_pose_target(move_robot=move_robot, pose=aligned_pose)
+                if hold_when_aligned:
+                    self._hold_pose(
+                        move_robot,
+                        aligned_pose,
+                        duration_sec=0.5,
+                        debug_run=debug_run,
+                        phase_name=f"{phase_name}_hold",
+                    )
+                return aligned_pose, observation, feature
+
+            delta_cam = np.array(
+                [
+                    nominal_depth * du / max(fx, 1.0),
+                    nominal_depth * dv / max(fy, 1.0),
+                    np.clip(0.00035 * dh, -0.012, 0.012),
+                ],
+                dtype=float,
+            )
+            delta_cam[0] = float(np.clip(delta_cam[0], -0.02, 0.02))
+            delta_cam[1] = float(np.clip(delta_cam[1], -0.02, 0.02))
+            delta_base = rotation_base_from_optical @ delta_cam
+            target_position = self._pose_position(current_pose) + delta_base
+            target_pose = self._make_pose(target_position, desired_quat)
+            self.set_pose_target(move_robot=move_robot, pose=target_pose)
+            self.sleep_for(0.1)
+
+        if best_observation is None:
+            return None, None, None
+        final_pose = self._make_pose(
+            self._pose_position(best_observation.controller_state.tcp_pose),
+            self._SFP_VISUAL_TEMPLATE["nominal_quat_wxyz"],
+        )
+        return final_pose, best_observation, best_feature
 
     def _run_stage_m0(
         self,
@@ -709,6 +918,259 @@ class QualPhasePilot(Policy):
         self.get_logger().info(f"M1 artifacts saved to {debug_run.root}")
         return True
 
+    def _run_stage_m2_sfp_center(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        if task.plug_type != "sfp":
+            return self._run_stage_hold_only(
+                "M2: SC not implemented yet; holding pose",
+                task,
+                get_observation,
+                move_robot,
+                send_feedback,
+            )
+
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        initial_feature = self._sfp_union_feature(observation)
+        debug_run.save_observation_snapshot(
+            "initial",
+            observation,
+            {
+                "feature_summary": (
+                    None if initial_feature is None else initial_feature["feature_summary"]
+                )
+            },
+        )
+        if observation is None or initial_feature is None:
+            debug_run.finalize(
+                False,
+                "no initial SFP feature detected",
+                observation,
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "center_camera_sfp_visual_servo",
+                "task_key": list(self._task_key(task)),
+                "visual_template": self._SFP_VISUAL_TEMPLATE,
+                "initial_feature": initial_feature,
+            }
+        )
+
+        send_feedback("M2: center-camera SFP visual servo")
+        debug_run.log_phase(
+            "acquire_target",
+            self.time_now().nanoseconds / 1e9,
+            "detected initial SFP feature in center camera",
+        )
+        debug_run.log_phase(
+            "approach",
+            self.time_now().nanoseconds / 1e9,
+            "running center-camera visual servo to SFP template",
+        )
+        aligned_pose, aligned_observation, aligned_feature = self._visual_servo_sfp(
+            get_observation,
+            move_robot,
+            debug_run,
+            phase_name="approach",
+            max_steps=25,
+            hold_when_aligned=True,
+        )
+        debug_run.save_observation_snapshot(
+            "after_localize",
+            aligned_observation,
+            {
+                "feature_summary": (
+                    None if aligned_feature is None else aligned_feature["feature_summary"]
+                )
+            },
+        )
+        if aligned_pose is None or aligned_observation is None or aligned_feature is None:
+            debug_run.finalize(False, "visual servo failed to localize SFP", aligned_observation)
+            return False
+
+        debug_run.log_phase(
+            "align",
+            self.time_now().nanoseconds / 1e9,
+            "localized SFP target and held pose",
+        )
+        debug_run.log_phase(
+            "done",
+            self.time_now().nanoseconds / 1e9,
+            "completed M2 SFP localization-only stage",
+        )
+        final_observation = get_observation()
+        debug_run.finalize(
+            True,
+            "m2_sfp_center completed",
+            final_observation,
+            {
+                "feature_summary": (
+                    None
+                    if final_observation is None
+                    else self._sfp_union_feature(final_observation)
+                )
+            },
+        )
+        self.get_logger().info(f"M2 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_m3_sfp_insert(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        if task.plug_type != "sfp":
+            return self._run_stage_hold_only(
+                "M3: SC not implemented yet; holding pose",
+                task,
+                get_observation,
+                move_robot,
+                send_feedback,
+            )
+
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        initial_feature = self._sfp_union_feature(observation)
+        debug_run.save_observation_snapshot(
+            "initial",
+            observation,
+            {
+                "feature_summary": (
+                    None if initial_feature is None else initial_feature["feature_summary"]
+                )
+            },
+        )
+        if observation is None or initial_feature is None:
+            debug_run.finalize(
+                False,
+                "no initial SFP feature detected",
+                observation,
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "center_camera_sfp_visual_servo_with_insert",
+                "task_key": list(self._task_key(task)),
+                "visual_template": self._SFP_VISUAL_TEMPLATE,
+                "initial_feature": initial_feature,
+            }
+        )
+
+        send_feedback("M3: center-camera SFP localization")
+        debug_run.log_phase(
+            "acquire_target",
+            self.time_now().nanoseconds / 1e9,
+            "detected initial SFP feature in center camera",
+        )
+        debug_run.log_phase(
+            "approach",
+            self.time_now().nanoseconds / 1e9,
+            "running center-camera visual servo to SFP template",
+        )
+        aligned_pose, aligned_observation, aligned_feature = self._visual_servo_sfp(
+            get_observation,
+            move_robot,
+            debug_run,
+            phase_name="approach",
+            max_steps=25,
+            hold_when_aligned=True,
+        )
+        debug_run.save_observation_snapshot(
+            "after_localize",
+            aligned_observation,
+            {
+                "feature_summary": (
+                    None if aligned_feature is None else aligned_feature["feature_summary"]
+                )
+            },
+        )
+        if aligned_pose is None or aligned_observation is None:
+            debug_run.finalize(False, "visual servo failed to localize SFP", aligned_observation)
+            return False
+
+        insertion_axis = np.array(self._SFP_INSERTION_VECTOR_BASE, dtype=float)
+        insertion_axis /= max(np.linalg.norm(insertion_axis), 1e-6)
+        approach_position = self._pose_position(aligned_pose)
+        port_position = approach_position + 0.0458 * insertion_axis
+        pushed_position = approach_position + 0.0608 * insertion_axis
+        nominal_quat = self._SFP_VISUAL_TEMPLATE["nominal_quat_wxyz"]
+        port_pose = self._make_pose(port_position, nominal_quat)
+        pushed_pose = self._make_pose(pushed_position, nominal_quat)
+
+        send_feedback("M3: slow SFP insertion push")
+        debug_run.log_phase(
+            "insert",
+            self.time_now().nanoseconds / 1e9,
+            "moving from localized pose along nominal SFP insertion axis",
+        )
+        self._move_for_duration(
+            move_robot,
+            aligned_pose,
+            port_pose,
+            duration_sec=1.8,
+            debug_run=debug_run,
+            phase_name="insert_approach",
+        )
+        self._move_for_duration(
+            move_robot,
+            port_pose,
+            pushed_pose,
+            duration_sec=1.2,
+            debug_run=debug_run,
+            phase_name="insert_push",
+        )
+        self._hold_pose(
+            move_robot,
+            pushed_pose,
+            duration_sec=2.0,
+            debug_run=debug_run,
+            phase_name="insert_hold",
+        )
+        inserted_observation = get_observation()
+        debug_run.save_observation_snapshot(
+            "after_insert",
+            inserted_observation,
+            {
+                "feature_summary": (
+                    None
+                    if inserted_observation is None
+                    else self._sfp_union_feature(inserted_observation)
+                )
+            },
+        )
+        debug_run.log_phase(
+            "done",
+            self.time_now().nanoseconds / 1e9,
+            "completed M3 SFP insertion baseline",
+        )
+        final_observation = get_observation()
+        debug_run.finalize(
+            True,
+            "m3_sfp_insert completed",
+            final_observation,
+            {
+                "feature_summary": (
+                    None
+                    if final_observation is None
+                    else self._sfp_union_feature(final_observation)
+                )
+            },
+        )
+        self.get_logger().info(f"M3 artifacts saved to {debug_run.root}")
+        return True
+
     def insert_cable(
         self,
         task: Task,
@@ -723,6 +1185,14 @@ class QualPhasePilot(Policy):
             return self._run_stage_m0(task, get_observation, move_robot, send_feedback)
         if self._stage == "m1_dev":
             return self._run_stage_m1_dev(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "m2_sfp_center":
+            return self._run_stage_m2_sfp_center(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "m3_sfp_insert":
+            return self._run_stage_m3_sfp_insert(
                 task, get_observation, move_robot, send_feedback
             )
 
