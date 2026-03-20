@@ -76,3 +76,28 @@ It should stay concise enough to scan quickly.
   - `the current scoring output path is overwritten in-place, so later milestones must copy or record it immediately`
 - Next action:
   - `commit M0, then add the M1 development-only target provider and phase-by-phase controller logging`
+
+## 2026-03-21 05:32 JST - M1 Development Target Controller Harness
+
+- Commit: `uncommitted`
+- Milestone: `M1`
+- Submission-safe: `no`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=m1_dev`, public-sample development target provider, headless eval via `/entrypoint.sh`, `ground_truth:=false`
+- Score total: `100.11421244878404`
+- Score by trial: `t1=98.11421244878404`, `t2=1`, `t3=1`
+- Artifacts:
+  - `/home/masa/aic_results/scoring.yaml`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_053144_m1_dev_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_053157_m1_dev_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_053212_m1_dev_task_1`
+- What worked:
+  - `phase machine and per-phase snapshots ran cleanly on both SFP and SC tasks`
+  - `trial_1 SFP inserted successfully and preserved Tier 2`
+  - `feature summaries are now saved at each phase, which gives M2 a direct template source`
+- What failed:
+  - `trial_2 SFP remained fragile despite using a hand-tuned target pose`
+  - `trial_3 SC target pose is clearly wrong in image space; the target leaves the center view by align/insert`
+  - `some TF-based distance scoring is still brittle when the run does not get close enough`
+- Next action:
+  - `replace the dev-only SFP target source with a legal center-camera localizer while keeping the same controller phases`

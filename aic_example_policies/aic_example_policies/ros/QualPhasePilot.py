@@ -24,6 +24,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from transforms3d._gohlketransforms import quaternion_slerp
 
 from aic_model.policy import (
     GetObservationCallback,
@@ -33,7 +34,7 @@ from aic_model.policy import (
 )
 from aic_model_interfaces.msg import Observation
 from aic_task_interfaces.msg import Task
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Point, Pose, Quaternion
 from rclpy.duration import Duration
 
 
@@ -104,6 +105,47 @@ def _image_to_bgr(image_msg) -> np.ndarray:
     return image.copy()
 
 
+def _mask_components(mask: np.ndarray, min_area_px: int) -> list[dict]:
+    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(mask)
+    components = []
+    for idx in range(1, num_labels):
+        x, y, w, h, area = stats[idx]
+        if int(area) < min_area_px:
+            continue
+        components.append(
+            {
+                "area_px": int(area),
+                "bbox_xywh": [int(x), int(y), int(w), int(h)],
+                "centroid_uv": [float(centroids[idx][0]), float(centroids[idx][1])],
+            }
+        )
+    components.sort(key=lambda item: item["area_px"], reverse=True)
+    return components
+
+
+def _union_bbox(components: list[dict]) -> list[int] | None:
+    if not components:
+        return None
+    x0 = min(component["bbox_xywh"][0] for component in components)
+    y0 = min(component["bbox_xywh"][1] for component in components)
+    x1 = max(
+        component["bbox_xywh"][0] + component["bbox_xywh"][2] for component in components
+    )
+    y1 = max(
+        component["bbox_xywh"][1] + component["bbox_xywh"][3] for component in components
+    )
+    return [int(x0), int(y0), int(x1 - x0), int(y1 - y0)]
+
+
+@dataclass(frozen=True)
+class PhaseTarget:
+    entrance_position: tuple[float, float, float]
+    entrance_quat_wxyz: tuple[float, float, float, float]
+    port_position: tuple[float, float, float]
+    port_quat_wxyz: tuple[float, float, float, float]
+    push_distance_m: float
+
+
 @dataclass
 class PhaseEvent:
     phase: str
@@ -127,8 +169,9 @@ class DebugRun:
         self.task = task
         self.phase_events: list[PhaseEvent] = []
         self.snapshot_count = 0
+        self.command_samples: list[dict] = []
 
-    def _write_json(self, path: Path, payload: dict) -> None:
+    def _write_json(self, path: Path, payload: dict | list) -> None:
         path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
     def _snapshot_dir(self, label: str) -> Path:
@@ -145,6 +188,26 @@ class DebugRun:
             self.root / "phase_timeline.json",
             {"events": [asdict(event) for event in self.phase_events]},
         )
+
+    def save_target_metadata(self, payload: dict) -> None:
+        self._write_json(self.root / "target_metadata.json", payload)
+
+    def log_command_sample(
+        self,
+        phase: str,
+        pose: Pose,
+        sim_time_sec: float,
+        note: str = "",
+    ) -> None:
+        self.command_samples.append(
+            {
+                "phase": phase,
+                "sim_time_sec": float(sim_time_sec),
+                "note": note,
+                "pose": _pose_to_dict(pose),
+            }
+        )
+        self._write_json(self.root / "command_samples.json", self.command_samples)
 
     def save_observation_snapshot(
         self, label: str, observation: Observation | None, extra: dict | None = None
@@ -199,9 +262,15 @@ class DebugRun:
         }
         self._write_json(snapshot_dir / "metadata.json", payload)
 
-    def finalize(self, success: bool, note: str, final_observation: Observation | None) -> None:
+    def finalize(
+        self,
+        success: bool,
+        note: str,
+        final_observation: Observation | None,
+        extra: dict | None = None,
+    ) -> None:
         if final_observation is not None:
-            self.save_observation_snapshot("final", final_observation, {"note": note})
+            self.save_observation_snapshot("final", final_observation, extra or {"note": note})
         self._write_json(
             self.root / "summary.json",
             {
@@ -218,16 +287,109 @@ class DebugRun:
                 "success": bool(success),
                 "note": note,
                 "phase_event_count": len(self.phase_events),
+                "command_sample_count": len(self.command_samples),
             },
         )
 
 
 class QualPhasePilot(Policy):
+    _DEV_TARGETS = {
+        ("sfp", "nic_card_mount_0", "sfp_port_0"): PhaseTarget(
+            entrance_position=(-0.384371, 0.213751, 0.237210),
+            entrance_quat_wxyz=(0.184074, 0.982508, -0.027752, -0.004918),
+            port_position=(-0.384371, 0.213172, 0.191413),
+            port_quat_wxyz=(0.184074, 0.982508, -0.027752, -0.004918),
+            push_distance_m=0.015,
+        ),
+        ("sfp", "nic_card_mount_1", "sfp_port_0"): PhaseTarget(
+            entrance_position=(-0.384399, 0.252639, 0.234351),
+            entrance_quat_wxyz=(0.183998, 0.982521, -0.027775, -0.005039),
+            port_position=(-0.384399, 0.252060, 0.188555),
+            port_quat_wxyz=(0.183998, 0.982521, -0.027775, -0.005039),
+            push_distance_m=0.015,
+        ),
+        ("sc", "sc_port_1", "sc_port_base"): PhaseTarget(
+            entrance_position=(-0.482564, 0.292170, 0.067884),
+            entrance_quat_wxyz=(0.337997, 0.662025, 0.668874, 0.009412),
+            port_position=(-0.482552, 0.292168, 0.052244),
+            port_quat_wxyz=(0.337997, 0.662025, 0.668874, 0.009412),
+            push_distance_m=0.008,
+        ),
+    }
+
     def __init__(self, parent_node):
         super().__init__(parent_node)
         self._stage = os.environ.get("AIC_QUAL_STAGE", "m0")
         self._hold_duration_sec = float(os.environ.get("AIC_QUAL_M0_HOLD_SEC", "3.0"))
+        self._approach_duration_sec = float(
+            os.environ.get("AIC_QUAL_APPROACH_SEC", "2.5")
+        )
+        self._entrance_hold_sec = float(
+            os.environ.get("AIC_QUAL_ENTRANCE_HOLD_SEC", "0.5")
+        )
+        self._align_duration_sec = float(
+            os.environ.get("AIC_QUAL_ALIGN_SEC", "2.5")
+        )
+        self._align_hold_sec = float(
+            os.environ.get("AIC_QUAL_ALIGN_HOLD_SEC", "0.5")
+        )
+        self._insert_duration_sec = float(
+            os.environ.get("AIC_QUAL_INSERT_SEC", "1.0")
+        )
+        self._final_hold_sec = float(
+            os.environ.get("AIC_QUAL_FINAL_HOLD_SEC", "2.5")
+        )
         self.get_logger().info(f"QualPhasePilot.__init__() stage={self._stage}")
+
+    def _task_key(self, task: Task) -> tuple[str, str, str]:
+        return (task.plug_type, task.target_module_name, task.port_name)
+
+    def _quat_xyzw_to_wxyz(self, quat: Quaternion) -> tuple[float, float, float, float]:
+        return (quat.w, quat.x, quat.y, quat.z)
+
+    def _quat_wxyz_to_xyzw(
+        self, quat: tuple[float, float, float, float]
+    ) -> Quaternion:
+        return Quaternion(x=quat[1], y=quat[2], z=quat[3], w=quat[0])
+
+    def _interpolate_pose(self, start: Pose, end: Pose, fraction: float) -> Pose:
+        start_pos = np.array(
+            [start.position.x, start.position.y, start.position.z], dtype=float
+        )
+        end_pos = np.array(
+            [end.position.x, end.position.y, end.position.z], dtype=float
+        )
+        xyz = (1.0 - fraction) * start_pos + fraction * end_pos
+        q = quaternion_slerp(
+            self._quat_xyzw_to_wxyz(start.orientation),
+            self._quat_xyzw_to_wxyz(end.orientation),
+            fraction,
+        )
+        return Pose(
+            position=Point(x=float(xyz[0]), y=float(xyz[1]), z=float(xyz[2])),
+            orientation=self._quat_wxyz_to_xyzw(q),
+        )
+
+    def _pose_from_target(
+        self,
+        position: tuple[float, float, float],
+        quat_wxyz: tuple[float, float, float, float],
+    ) -> Pose:
+        return Pose(
+            position=Point(x=position[0], y=position[1], z=position[2]),
+            orientation=self._quat_wxyz_to_xyzw(quat_wxyz),
+        )
+
+    def _push_pose(self, target: PhaseTarget) -> Pose:
+        entrance = np.array(target.entrance_position, dtype=float)
+        port = np.array(target.port_position, dtype=float)
+        insertion_axis = port - entrance
+        insertion_axis /= max(np.linalg.norm(insertion_axis), 1e-6)
+        pushed = port + target.push_distance_m * insertion_axis
+        return Pose(
+            position=Point(x=float(pushed[0]), y=float(pushed[1]), z=float(pushed[2])),
+            orientation=self._quat_wxyz_to_xyzw(target.port_quat_wxyz),
+        )
 
     def _wait_for_observation(
         self, get_observation: GetObservationCallback, timeout_sec: float = 5.0
@@ -240,17 +402,103 @@ class QualPhasePilot(Policy):
             self.sleep_for(0.05)
         return None
 
-    def _hold_current_pose(
+    def _hold_pose(
         self,
-        observation: Observation,
         move_robot: MoveRobotCallback,
+        pose: Pose,
         duration_sec: float,
+        debug_run: DebugRun | None = None,
+        phase_name: str = "hold",
     ) -> None:
-        pose = observation.controller_state.tcp_pose
         steps = max(1, int(duration_sec / 0.05))
-        for _ in range(steps):
+        for step in range(steps):
             self.set_pose_target(move_robot=move_robot, pose=pose)
+            if debug_run is not None and (step == 0 or step == steps - 1):
+                debug_run.log_command_sample(
+                    phase_name,
+                    pose,
+                    self.time_now().nanoseconds / 1e9,
+                    note=f"hold step {step + 1}/{steps}",
+                )
             self.sleep_for(0.05)
+
+    def _move_for_duration(
+        self,
+        move_robot: MoveRobotCallback,
+        start_pose: Pose,
+        end_pose: Pose,
+        duration_sec: float,
+        debug_run: DebugRun | None = None,
+        phase_name: str = "move",
+    ) -> None:
+        steps = max(1, int(duration_sec / 0.05))
+        log_stride = max(1, steps // 4)
+        for step in range(1, steps + 1):
+            fraction = step / steps
+            target_pose = self._interpolate_pose(start_pose, end_pose, fraction)
+            self.set_pose_target(move_robot=move_robot, pose=target_pose)
+            if debug_run is not None and (
+                step == 1 or step == steps or step % log_stride == 0
+            ):
+                debug_run.log_command_sample(
+                    phase_name,
+                    target_pose,
+                    self.time_now().nanoseconds / 1e9,
+                    note=f"interp {step}/{steps}",
+                )
+            self.sleep_for(0.05)
+
+    def _extract_feature_summary(
+        self, task: Task, observation: Observation | None
+    ) -> dict:
+        if observation is None:
+            return {"available": False}
+
+        center = _image_to_bgr(observation.center_image)
+        hsv = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+        summary = {
+            "available": True,
+            "task_key": list(self._task_key(task)),
+            "image_shape": [int(center.shape[1]), int(center.shape[0])],
+        }
+
+        if task.plug_type == "sfp":
+            green_mask = cv2.inRange(
+                hsv,
+                np.array([40, 40, 20], dtype=np.uint8),
+                np.array([90, 255, 255], dtype=np.uint8),
+            )
+            green_components = _mask_components(green_mask, min_area_px=80)
+            green_components.sort(key=lambda item: item["centroid_uv"][0])
+            summary["center_camera"] = {
+                "detector": "green_mask",
+                "component_count": len(green_components),
+                "components": green_components,
+                "union_bbox_xywh": _union_bbox(green_components),
+            }
+        elif task.plug_type == "sc":
+            cyan_mask = cv2.inRange(
+                hsv,
+                np.array([80, 80, 80], dtype=np.uint8),
+                np.array([110, 255, 255], dtype=np.uint8),
+            )
+            magenta_mask = cv2.inRange(
+                hsv,
+                np.array([130, 80, 80], dtype=np.uint8),
+                np.array([170, 255, 255], dtype=np.uint8),
+            )
+            cyan_components = _mask_components(cyan_mask, min_area_px=80)
+            magenta_components = _mask_components(magenta_mask, min_area_px=80)
+            summary["center_camera"] = {
+                "detector": "cyan_magenta_masks",
+                "cyan_components": cyan_components,
+                "magenta_components": magenta_components,
+                "cyan_union_bbox_xywh": _union_bbox(cyan_components),
+                "magenta_union_bbox_xywh": _union_bbox(magenta_components),
+            }
+        else:
+            summary["center_camera"] = {"detector": "none"}
+        return summary
 
     def _run_stage_m0(
         self,
@@ -262,7 +510,11 @@ class QualPhasePilot(Policy):
         debug_run = DebugRun(self._stage, task)
         debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
         observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
-        debug_run.save_observation_snapshot("initial", observation)
+        debug_run.save_observation_snapshot(
+            "initial",
+            observation,
+            {"feature_summary": self._extract_feature_summary(task, observation)},
+        )
         if observation is None:
             debug_run.finalize(False, "no observation received", None)
             return False
@@ -273,15 +525,188 @@ class QualPhasePilot(Policy):
             self.time_now().nanoseconds / 1e9,
             "captured initial observation",
         )
-        self._hold_current_pose(observation, move_robot, self._hold_duration_sec)
+        self._hold_pose(
+            move_robot,
+            observation.controller_state.tcp_pose,
+            self._hold_duration_sec,
+            debug_run=debug_run,
+            phase_name="observe",
+        )
         final_observation = get_observation()
         debug_run.log_phase(
             "done",
             self.time_now().nanoseconds / 1e9,
             "completed M0 hold",
         )
-        debug_run.finalize(True, "m0 completed", final_observation)
+        debug_run.finalize(
+            True,
+            "m0 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
         self.get_logger().info(f"M0 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_m1_dev(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+
+        observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            observation,
+            {"feature_summary": self._extract_feature_summary(task, observation)},
+        )
+        if observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        task_key = self._task_key(task)
+        target = self._DEV_TARGETS.get(task_key)
+        if target is None:
+            debug_run.finalize(
+                False,
+                f"no development target for task key {task_key}",
+                observation,
+                {"feature_summary": self._extract_feature_summary(task, observation)},
+            )
+            return False
+
+        entrance_pose = self._pose_from_target(
+            target.entrance_position, target.entrance_quat_wxyz
+        )
+        port_pose = self._pose_from_target(target.port_position, target.port_quat_wxyz)
+        pushed_pose = self._push_pose(target)
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "development_pose_targets",
+                "task_key": list(task_key),
+                "target": asdict(target),
+                "entrance_pose": _pose_to_dict(entrance_pose),
+                "port_pose": _pose_to_dict(port_pose),
+                "pushed_pose": _pose_to_dict(pushed_pose),
+            }
+        )
+
+        current_pose = observation.controller_state.tcp_pose
+
+        send_feedback("M1: using development target provider")
+        debug_run.log_phase(
+            "acquire_target",
+            self.time_now().nanoseconds / 1e9,
+            "loaded development target pose",
+        )
+
+        send_feedback("M1: approaching development entrance pose")
+        debug_run.log_phase(
+            "approach",
+            self.time_now().nanoseconds / 1e9,
+            "moving current pose to entrance pose",
+        )
+        self._move_for_duration(
+            move_robot,
+            current_pose,
+            entrance_pose,
+            duration_sec=self._approach_duration_sec,
+            debug_run=debug_run,
+            phase_name="approach",
+        )
+        approach_observation = get_observation()
+        debug_run.save_observation_snapshot(
+            "after_approach",
+            approach_observation,
+            {"feature_summary": self._extract_feature_summary(task, approach_observation)},
+        )
+
+        self._hold_pose(
+            move_robot,
+            entrance_pose,
+            duration_sec=self._entrance_hold_sec,
+            debug_run=debug_run,
+            phase_name="approach_hold",
+        )
+
+        send_feedback("M1: aligning to development port target")
+        debug_run.log_phase(
+            "align",
+            self.time_now().nanoseconds / 1e9,
+            "moving entrance pose to port pose",
+        )
+        self._move_for_duration(
+            move_robot,
+            entrance_pose,
+            port_pose,
+            duration_sec=self._align_duration_sec,
+            debug_run=debug_run,
+            phase_name="align",
+        )
+        self._hold_pose(
+            move_robot,
+            port_pose,
+            duration_sec=self._align_hold_sec,
+            debug_run=debug_run,
+            phase_name="align_hold",
+        )
+        align_observation = get_observation()
+        debug_run.save_observation_snapshot(
+            "after_align",
+            align_observation,
+            {"feature_summary": self._extract_feature_summary(task, align_observation)},
+        )
+
+        send_feedback("M1: inserting along development target axis")
+        debug_run.log_phase(
+            "insert",
+            self.time_now().nanoseconds / 1e9,
+            "moving port pose to pushed pose",
+        )
+        self._move_for_duration(
+            move_robot,
+            port_pose,
+            pushed_pose,
+            duration_sec=self._insert_duration_sec,
+            debug_run=debug_run,
+            phase_name="insert",
+        )
+        self._hold_pose(
+            move_robot,
+            pushed_pose,
+            duration_sec=self._final_hold_sec,
+            debug_run=debug_run,
+            phase_name="insert_hold",
+        )
+        insert_observation = get_observation()
+        debug_run.save_observation_snapshot(
+            "after_insert",
+            insert_observation,
+            {"feature_summary": self._extract_feature_summary(task, insert_observation)},
+        )
+
+        debug_run.log_phase(
+            "recover",
+            self.time_now().nanoseconds / 1e9,
+            "recovery not triggered; keeping last insertion pose",
+        )
+        debug_run.log_phase(
+            "done",
+            self.time_now().nanoseconds / 1e9,
+            "completed M1 development controller path",
+        )
+        final_observation = get_observation()
+        debug_run.finalize(
+            True,
+            "m1_dev completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"M1 artifacts saved to {debug_run.root}")
         return True
 
     def insert_cable(
@@ -296,6 +721,10 @@ class QualPhasePilot(Policy):
         )
         if self._stage == "m0":
             return self._run_stage_m0(task, get_observation, move_robot, send_feedback)
+        if self._stage == "m1_dev":
+            return self._run_stage_m1_dev(
+                task, get_observation, move_robot, send_feedback
+            )
 
         self.get_logger().error(f"Stage '{self._stage}' is not implemented yet.")
         return False
