@@ -52,3 +52,27 @@ It should stay concise enough to scan quickly.
   - `strategy is not submission-safe because it depends on public-sample structure`
 - Next action:
   - `replace replay assumptions with target-local perception and controller milestones`
+
+## 2026-03-21 05:21 JST - M0 Observability Harness
+
+- Commit: `uncommitted`
+- Milestone: `M0`
+- Submission-safe: `yes`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=m0`, headless eval via `/entrypoint.sh`, `ground_truth:=false`
+- Score total: `3`
+- Score by trial: `t1=1`, `t2=1`, `t3=1`
+- Artifacts:
+  - `/home/masa/aic_results/scoring.yaml`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_052118_m0_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_052126_m0_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_052133_m0_task_1`
+- What worked:
+  - `all three trials completed without a policy crash`
+  - `initial/final image montages, metadata, and phase timelines were saved`
+  - `the task mix included both SFP and SC, so the harness already captured both views`
+- What failed:
+  - `this milestone intentionally does not move toward insertion, so only Tier 1 scored`
+  - `the current scoring output path is overwritten in-place, so later milestones must copy or record it immediately`
+- Next action:
+  - `commit M0, then add the M1 development-only target provider and phase-by-phase controller logging`

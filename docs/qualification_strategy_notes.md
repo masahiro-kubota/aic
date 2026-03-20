@@ -648,6 +648,281 @@ The next concrete work items should follow the milestone order above:
 - add force-guided refinement
 - add learned residuals only after the baseline is stable
 
+## Concrete Milestone Execution Plan
+
+This section is the execution contract for the actual implementation work.
+The policy should move through these milestones in order, without skipping M1
+or M2 just because a later idea seems attractive.
+
+Each milestone must satisfy three conditions before moving on:
+
+- the implementation goal is present in code
+- one representative run is logged in `qualification_experiment_log.md`
+- one commit records the milestone score, artifact path, and dominant failure mode
+
+### M0. Observability Harness
+
+Purpose:
+
+- verify that runs complete
+- verify that images, phase transitions, and controller summaries are saved
+
+Concrete deliverables:
+
+- `QualPhasePilot` skeleton with explicit phases
+- per-trial debug directory under a writable runtime path
+- initial/final image montage, metadata JSON, and summary JSON
+
+Validation gate:
+
+- one full 3-trial run completes without policy crash
+- artifacts exist for all three trials
+- failure timing is visible from saved phase logs
+
+Commit gate:
+
+- commit as soon as the harness is stable, even if score is only Tier 1
+
+### M1. Development-Only Controller Harness
+
+Purpose:
+
+- validate the controller state machine before legal perception is introduced
+
+Concrete deliverables:
+
+- add a `target_provider` abstraction to `QualPhasePilot`
+- implement a development-only provider that returns coarse target poses for:
+  - SFP `nic_card_mount_0`
+  - SFP `nic_card_mount_1`
+  - SC `sc_port_*`
+- implement the controller phases end-to-end:
+  - `acquire_target`
+  - `approach`
+  - `align`
+  - `insert`
+  - `recover`
+- save target metadata, commanded pose summaries, and per-phase timing
+
+Expected score profile:
+
+- low but clearly above pure `M0`
+- correctness of phase execution matters more than raw score
+
+Validation gate:
+
+- all phases execute in the intended order on representative SFP and SC trials
+- pre-insertion pose is reached reproducibly
+- obvious controller issues are fixed before perception is added
+
+Commit gate:
+
+- commit when controller behavior is predictable enough that future failures are
+  likely to be target-localization errors rather than state-machine bugs
+
+### M2. First Legal Baseline: SFP Center-Camera Localizer
+
+Purpose:
+
+- replace the development-only target source with the first submission-safe
+  SFP target estimator
+
+Concrete deliverables:
+
+- use only the center camera for SFP
+- implement a coarse localizer that estimates:
+  - target pixel center
+  - slot orientation cue
+  - confidence
+- convert the localizer output into a target-relative pre-insertion pose
+- route SC tasks through a safe no-op or hold path so SFP can be debugged in
+  isolation
+
+Expected score profile:
+
+- still modest
+- success means the robot approaches the correct NIC for the right reason
+
+Validation gate:
+
+- on repeated SFP trials, the TCP moves toward the correct port family
+- failures can be classified as detection, standoff, orientation, or insertion
+
+Commit gate:
+
+- commit when SFP targeting is visibly legal and repeatable, even if insertion
+  is still weak
+
+### M3. SFP Target-Relative Insertion Baseline
+
+Purpose:
+
+- turn the legal SFP localizer into a low-risk, score-producing baseline
+
+Concrete deliverables:
+
+- conservative pre-insertion standoff
+- slow axial insertion
+- one bounded retreat and retry
+- explicit force and duration logging for the insertion attempt
+
+Expected score profile:
+
+- moderate SFP score with limited variance
+
+Validation gate:
+
+- repeated SFP runs show a consistent approach pattern
+- Tier 2 is preserved by avoiding aggressive pushing
+- dominant failures are local alignment misses, not gross targeting mistakes
+
+Commit gate:
+
+- commit when this becomes the first trustworthy submission-safe SFP baseline
+
+### M4. SC Legal Baseline
+
+Purpose:
+
+- extend the same legal target-local stack to SC without changing the overall
+  policy architecture
+
+Concrete deliverables:
+
+- add SC-specific localizer logic
+- add SC pre-insertion geometry and alignment behavior
+- keep the same phase machine and debug outputs used for SFP
+
+Expected score profile:
+
+- total score rises, but SC may still trail SFP
+
+Validation gate:
+
+- SC reaches a meaningful pre-insertion pose
+- failure modes are understandable and mostly near-contact
+- SFP behavior does not regress while SC support is added
+
+Commit gate:
+
+- commit when both SFP and SC run through the same debuggable legal pipeline
+
+### M5. Multi-Camera Late Fusion
+
+Purpose:
+
+- improve robustness while preserving debuggability
+
+Concrete deliverables:
+
+- keep center-only logic as the fallback
+- use left/right cameras only for:
+  - confidence reweighting
+  - lateral disambiguation
+  - optional depth refinement
+
+Expected score profile:
+
+- moderate improvement in reliability, not necessarily a dramatic jump
+
+Validation gate:
+
+- fusion helps more often than it hurts
+- when fusion is uncertain, the controller falls back cleanly
+
+Commit gate:
+
+- commit only if fusion measurably improves repeatability over center-only
+
+### M6. Force-Guided Final Insertion And Recovery
+
+Purpose:
+
+- convert near-miss approaches into more stable insertions
+
+Concrete deliverables:
+
+- contact-triggered slow insertion mode
+- bounded lateral micro-search near contact
+- explicit retreat conditions
+- per-attempt force, time, and retry caps
+
+Expected score profile:
+
+- this is the first milestone where score should rise meaningfully for both SFP
+  and SC
+
+Validation gate:
+
+- fewer failures stop at "close but not inserted"
+- contact behavior is smoother, not more chaotic
+- the recovery outcome is legible from saved artifacts
+
+Commit gate:
+
+- commit when force-guided refinement improves insertion quality without
+  collapsing Tier 2 through excessive contact
+
+### M7. Learned Residuals Near Contact
+
+Purpose:
+
+- add learning only after the deterministic stack is measurable and stable
+
+Concrete deliverables:
+
+- fixed deterministic perception and state machine
+- learned residual only for:
+  - final lateral correction
+  - yaw correction
+  - insertion-axis correction
+
+Expected score profile:
+
+- potential high-score milestone, but only after M6 is trustworthy
+
+Validation gate:
+
+- residual improves a stable baseline
+- ablations show the residual is adding value instead of hiding regressions
+
+Commit gate:
+
+- commit only if the learned residual reliably beats the non-residual M6 system
+
+## Run And Commit Protocol
+
+Each milestone should be executed with the same operational discipline so that
+results are comparable.
+
+### Before Every Validation Run
+
+- rebuild the modified package:
+  - `cd /home/masa/ws_aic/src/aic && pixi reinstall ros-kilted-aic-example-policies`
+- restart the eval container if previous processes are still alive
+- launch eval with an explicit display export:
+  - `docker exec -i aic_eval bash -lc 'export DISPLAY=:1; /entrypoint.sh ground_truth:=false start_aic_engine:=true shutdown_on_aic_engine_exit:=true launch_rviz:=false gazebo_gui:=false'`
+- launch the model with an explicit display export as well, even if the run is
+  headless, to keep the command path consistent:
+  - `cd /home/masa/ws_aic/src/aic && export DISPLAY=:1 && export RMW_IMPLEMENTATION=rmw_zenoh_cpp && export AIC_QUAL_STAGE=... && pixi run ros2 run aic_model aic_model --ros-args -p use_sim_time:=true -p policy:=aic_example_policies.ros.QualPhasePilot`
+
+### After Every Validation Run
+
+- record:
+  - total score
+  - per-trial scores
+  - representative artifact paths
+  - dominant failure mode
+- add one short entry to `qualification_experiment_log.md`
+- make one milestone commit with the same score summary in the commit body
+
+### Non-Negotiable Rule For This Work
+
+Do not jump directly from `M0` to `M4` or `M6`.
+If a milestone exposes a failure, fix that failure before moving on.
+The goal is a debuggable path to SC and force-guided refinement, not a pile of
+partially overlapping ideas.
+
 ## Commit And Experiment Discipline
 
 Commits should help debugging, not just checkpoint code.
