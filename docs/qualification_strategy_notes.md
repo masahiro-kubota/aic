@@ -660,6 +660,42 @@ Each milestone must satisfy three conditions before moving on:
 - one representative run is logged in `qualification_experiment_log.md`
 - one commit records the milestone score, artifact path, and dominant failure mode
 
+## Milestone Tracker
+
+This tracker exists to make the current state obvious at a glance.
+It should be updated whenever a milestone is completed or blocked.
+
+| Milestone | Focus | Current status | Gate to move on |
+| --- | --- | --- | --- |
+| `M0` | observability harness | `done` | artifacts saved for all trials |
+| `M1` | development-only controller harness | `done` | controller phases behave predictably |
+| `M2` | legal SFP center-camera localizer | `done` | legal targeting is visible and repeatable |
+| `M3` | legal SFP insertion baseline | `in progress` | SFP must score above pure Tier 1 without regressing into chaotic motion |
+| `M4` | legal SC baseline | `pending` | do not start until `M3` is a trustworthy SFP baseline |
+| `M5` | multi-camera late fusion | `pending` | do not start until `M4` is measurable |
+| `M6` | force-guided final insertion and recovery | `pending` | do not start until `M4` reaches near-contact failures we can refine |
+| `M7` | learned residual near contact | `pending` | do not start until `M6` is stable |
+
+### Current Blocking Issue
+
+As of `2026-03-21`, the plan is blocked at `M3`.
+
+What is already true:
+
+- `M0` exists and saves usable debug artifacts
+- `M1` proved the controller state machine can score on at least one SFP trial
+- `M2` proved the legal SFP localizer moves toward the correct module
+
+What is not true yet:
+
+- the `M2` localizer does not yet deliver a strong enough pre-insertion pose for
+  the `M3` fixed insertion step
+- the current `M3` insertion push preserves legality, but still scores like pure
+  Tier 1 on the representative run
+
+Therefore the next work item is not `M4` or `M6`.
+The next work item is to fix `M3` until SFP becomes a reliable, legal baseline.
+
 ### M0. Observability Harness
 
 Purpose:
