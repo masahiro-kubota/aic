@@ -670,13 +670,51 @@ It should be updated whenever a milestone is completed or blocked.
 | `M0` | observability harness | `done` | artifacts saved for all trials |
 | `M1` | development-only controller harness | `done` | controller phases behave predictably |
 | `M2` | legal SFP center-camera localizer | `done` | legal targeting is visible and repeatable |
-| `M3` | legal SFP insertion baseline | `in progress` | SFP must score above pure Tier 1 without regressing into chaotic motion |
-| `M4` | legal SC baseline | `pending` | do not start until `M3` is a trustworthy SFP baseline |
-| `M5` | multi-camera late fusion | `pending` | do not start until `M4` is measurable |
-| `M6` | force-guided final insertion and recovery | `pending` | do not start until `M4` reaches near-contact failures we can refine |
-| `M7` | learned residual near contact | `pending` | do not start until `M6` is stable |
+| `M3` | legal SFP insertion baseline | `implemented, still weak` | SFP must score above pure Tier 1 without regressing into chaotic motion |
+| `M4` | legal SC baseline | `done (development-oriented baseline)` | replace replay assumptions with a legal SC target provider |
+| `M5` | multi-camera late fusion | `done` | preserve the M5 SFP gain while making SC more legal |
+| `M6` | force-guided final insertion and recovery | `done` | keep the bounded search, but feed it a better SC pre-insertion pose |
+| `M7` | learned residual near contact | `done` | upgrade SC target acquisition before tuning the residual loop further |
 
-### Current Blocking Issue
+## Executed Milestone Results
+
+This table records the representative score that currently stands for each
+implemented milestone.
+The paths below should be the first place to look when a later change regresses.
+
+| Milestone | Representative score | Representative artifact | Key takeaway |
+| --- | --- | --- | --- |
+| `M0` | `3.0` | `/home/masa/ws_aic_runtime/qualification_debug/20260321_052118_m0_task_1` | observability harness is sound |
+| `M1` | `100.11421244878404` | `/home/masa/ws_aic_runtime/qualification_debug/20260321_053144_m1_dev_task_1` | controller phases can score when given a development target |
+| `M2` | `3.0` | `/home/masa/ws_aic_runtime/qualification_debug/20260321_053809_m2_sfp_center_task_1` | legal SFP localizer moves toward the right module but does not insert yet |
+| `M3` | `-21.0` | `/home/masa/ws_aic_runtime/qualification_debug/20260321_054924_m3_sfp_insert_task_1` | legal fixed-push SFP insertion is still too brittle |
+| `M4` | `93.084972039114518` | `/home/masa/aic_results/qual_m4_public_baseline_20260321_064111/scoring.yaml` | first nontrivial full-pipeline reference |
+| `M5` | `109.96488164803876` | `/home/masa/aic_results/qual_m5_multi_camera_late_fusion_20260321_064904/scoring.yaml` | multi-camera SFP refinement gives a clear gain |
+| `M6` | `110.0571545895495` | `/home/masa/aic_results/qual_m6_sc_force_refine_20260321_071303/scoring.yaml` | bounded SC force search is implemented and measurable |
+| `M7` | `111.43384153152546` | `/home/masa/aic_results/qual_m7_residual_refine_20260321_073833/scoring.yaml` | fresh-observation gating improves the full stack, but SC perception is still the bottleneck |
+
+### Current State
+
+As of `2026-03-21`, the milestone stack through `M7` is implemented and has
+representative runs.
+
+What is already true:
+
+- `M0` through `M7` all exist in code and have at least one representative run
+- the total score increased step by step across the development-oriented stages:
+  `M4 -> M5 -> M6 -> M7 = 93.08 -> 109.96 -> 110.06 -> 111.43`
+- fresh-observation gating and sim-time pacing improved the reliability of the
+  SFP stages
+
+What is not true yet:
+
+- the legal path is still blocked at `M3`; the submission-safe SFP insertion
+  baseline is not good enough yet
+- the current SC path is still development-oriented and does not earn SC points
+- further force/residual tuning is not the main bottleneck anymore; target-local
+  SC perception is
+
+### Historical Blocking Issue
 
 As of `2026-03-21`, the plan is blocked at `M3`.
 
