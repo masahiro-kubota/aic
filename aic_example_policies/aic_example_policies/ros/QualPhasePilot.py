@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from dataclasses import asdict, dataclass
@@ -25,7 +26,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from transforms3d._gohlketransforms import quaternion_slerp
-from transforms3d.quaternions import quat2mat
+from transforms3d.quaternions import mat2quat, quat2mat
 
 from aic_example_policies.ros.PublicTrialPosePilot import (
     PublicTrialPosePilot,
@@ -101,6 +102,18 @@ def _controller_state_to_dict(controller_state) -> dict:
         },
         "target_mode": int(controller_state.target_mode.mode),
     }
+
+
+def _jsonable(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def _image_to_bgr(image_msg) -> np.ndarray:
@@ -179,7 +192,7 @@ class DebugRun:
         self.command_samples: list[dict] = []
 
     def _write_json(self, path: Path, payload: dict | list) -> None:
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        path.write_text(json.dumps(_jsonable(payload), indent=2, sort_keys=True))
 
     def _snapshot_dir(self, label: str) -> Path:
         self.snapshot_count += 1
@@ -348,6 +361,18 @@ class QualPhasePilot(Policy):
         "cyan_centroid_uv": (626.4, 759.0),
         "nominal_depth_m": 0.055,
     }
+    _SC_SUBMISSION_COARSE_TEMPLATE = {
+        "cyan_centroid_uv": (520.0, 620.0),
+        "desired_area_px": 5500.0,
+        "nominal_depth_m": 0.085,
+    }
+    _SC_SUBMISSION_FINE_TEMPLATE = {
+        "cyan_centroid_uv": (626.4, 759.0),
+        "desired_area_px": 8500.0,
+        "nominal_depth_m": 0.06,
+    }
+    _SC_MAGENTA_REFERENCE_ANGLE_DEG = 8.4
+    _SC_NOMINAL_QUAT_WXYZ = (0.337997, 0.662025, 0.668874, 0.009412)
     _SFP_TOOL_INSERTION_AXIS = (
         0.000159431701,
         -0.350186974,
@@ -593,6 +618,15 @@ class QualPhasePilot(Policy):
     def _lookup_camera_rotation_base_from_optical(
         self, camera_frame: str
     ) -> np.ndarray | None:
+        pose = self._lookup_camera_pose_base_from_optical(camera_frame)
+        if pose is None:
+            return None
+        rotation_base_from_optical, _ = pose
+        return rotation_base_from_optical
+
+    def _lookup_camera_pose_base_from_optical(
+        self, camera_frame: str
+    ) -> tuple[np.ndarray, np.ndarray] | None:
         try:
             transform = self._parent_node._tf_buffer.lookup_transform(
                 "base_link",
@@ -608,7 +642,15 @@ class QualPhasePilot(Policy):
             transform.transform.rotation.y,
             transform.transform.rotation.z,
         )
-        return quat2mat(quat_wxyz)
+        translation_base = np.array(
+            [
+                float(transform.transform.translation.x),
+                float(transform.transform.translation.y),
+                float(transform.transform.translation.z),
+            ],
+            dtype=float,
+        )
+        return quat2mat(quat_wxyz), translation_base
 
     def _camera_view(
         self, observation: Observation | None, camera_name: str
@@ -620,6 +662,50 @@ class QualPhasePilot(Policy):
         if camera_name == "right":
             return _image_to_bgr(observation.right_image), observation.right_camera_info
         return _image_to_bgr(observation.center_image), observation.center_camera_info
+
+    def _sc_feature_for_camera(
+        self, observation: Observation | None, camera_name: str
+    ) -> dict | None:
+        if observation is None:
+            return None
+        image, _ = self._camera_view(observation, camera_name)
+        if image is None:
+            return None
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        cyan_mask = cv2.inRange(
+            hsv,
+            np.array([80, 80, 80], dtype=np.uint8),
+            np.array([110, 255, 255], dtype=np.uint8),
+        )
+        cyan_components = _mask_components(cyan_mask, min_area_px=80)
+        magenta_mask = cv2.inRange(
+            hsv,
+            np.array([130, 80, 80], dtype=np.uint8),
+            np.array([170, 255, 255], dtype=np.uint8),
+        )
+        magenta_components = _mask_components(magenta_mask, min_area_px=80)
+        if not cyan_components:
+            return None
+        largest = max(cyan_components, key=lambda item: item["area_px"])
+        magenta_angle_deg = None
+        if magenta_components:
+            ys, xs = np.nonzero(magenta_mask)
+            if len(xs) >= 5:
+                rect = cv2.minAreaRect(np.column_stack([xs, ys]).astype(np.float32))
+                (_, _), (w, h), angle_deg = rect
+                if w < h:
+                    angle_deg += 90.0
+                magenta_angle_deg = float(angle_deg)
+        return {
+            "camera_name": camera_name,
+            "cyan_components": cyan_components,
+            "cyan_centroid_uv": tuple(largest["centroid_uv"]),
+            "cyan_bbox_xywh": tuple(largest["bbox_xywh"]),
+            "cyan_area_px": int(largest["area_px"]),
+            "magenta_components": magenta_components,
+            "magenta_union_bbox_xywh": _union_bbox(magenta_components),
+            "magenta_angle_deg": magenta_angle_deg,
+        }
 
     def _sfp_union_feature_for_camera(
         self, observation: Observation | None, camera_name: str
@@ -669,27 +755,182 @@ class QualPhasePilot(Policy):
         )
 
     def _sc_center_feature(self, observation: Observation | None) -> dict | None:
+        return self._sc_feature_for_camera(observation, "center")
+
+    def _pixel_ray_optical(
+        self,
+        camera_info: CameraInfo,
+        uv: tuple[float, float],
+    ) -> np.ndarray | None:
+        fx = float(camera_info.k[0])
+        fy = float(camera_info.k[4])
+        cx = float(camera_info.k[2])
+        cy = float(camera_info.k[5])
+        if fx <= 1e-6 or fy <= 1e-6:
+            return None
+        u, v = uv
+        ray = np.array([(u - cx) / fx, (v - cy) / fy, 1.0], dtype=float)
+        norm = np.linalg.norm(ray)
+        if norm <= 1e-6:
+            return None
+        return ray / norm
+
+    def _camera_ray_base(
+        self,
+        observation: Observation | None,
+        camera_name: str,
+        uv: tuple[float, float],
+    ) -> tuple[np.ndarray, np.ndarray] | None:
         if observation is None:
             return None
-        image, _ = self._camera_view(observation, "center")
-        if image is None:
+        _, camera_info = self._camera_view(observation, camera_name)
+        if camera_info is None:
             return None
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        cyan_mask = cv2.inRange(
-            hsv,
-            np.array([80, 80, 80], dtype=np.uint8),
-            np.array([110, 255, 255], dtype=np.uint8),
+        ray_optical = self._pixel_ray_optical(camera_info, uv)
+        if ray_optical is None:
+            return None
+        camera_pose = self._lookup_camera_pose_base_from_optical(
+            self._CAMERA_FRAMES[camera_name]
         )
-        cyan_components = _mask_components(cyan_mask, min_area_px=80)
-        if not cyan_components:
+        if camera_pose is None:
             return None
-        largest = max(cyan_components, key=lambda item: item["area_px"])
+        rotation_base_from_optical, translation_base = camera_pose
+        ray_base = rotation_base_from_optical @ ray_optical
+        ray_norm = np.linalg.norm(ray_base)
+        if ray_norm <= 1e-6:
+            return None
+        return translation_base, ray_base / ray_norm
+
+    def _triangulate_point_from_rays(
+        self,
+        rays: list[tuple[np.ndarray, np.ndarray]],
+    ) -> np.ndarray | None:
+        if len(rays) < 2:
+            return None
+        lhs = np.zeros((3, 3), dtype=float)
+        rhs = np.zeros(3, dtype=float)
+        for origin, direction in rays:
+            direction = direction / max(np.linalg.norm(direction), 1e-6)
+            projector = np.eye(3, dtype=float) - np.outer(direction, direction)
+            lhs += projector
+            rhs += projector @ origin
+        try:
+            solution, *_ = np.linalg.lstsq(lhs, rhs, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(np.isfinite(solution)):
+            return None
+        return solution
+
+    def _sc_triangulated_feature(self, observation: Observation | None) -> dict | None:
+        if observation is None:
+            return None
+        per_camera: dict[str, dict] = {}
+        rays: list[tuple[np.ndarray, np.ndarray]] = []
+        for camera_name in ("left", "center", "right"):
+            feature = self._sc_feature_for_camera(observation, camera_name)
+            if feature is None:
+                continue
+            per_camera[camera_name] = feature
+            ray = self._camera_ray_base(
+                observation,
+                camera_name,
+                feature["cyan_centroid_uv"],
+            )
+            if ray is not None:
+                rays.append(ray)
+        triangulated_point_base = self._triangulate_point_from_rays(rays)
+        if triangulated_point_base is None or "center" not in per_camera:
+            return None
+
+        center_pose = self._lookup_camera_pose_base_from_optical(self._CENTER_CAMERA_FRAME)
+        if center_pose is None:
+            return None
+        rotation_base_from_optical, translation_base = center_pose
+        point_center_optical = rotation_base_from_optical.T @ (
+            triangulated_point_base - translation_base
+        )
+        center_feature = per_camera["center"]
         return {
-            "cyan_components": cyan_components,
-            "cyan_centroid_uv": tuple(largest["centroid_uv"]),
-            "cyan_bbox_xywh": tuple(largest["bbox_xywh"]),
-            "cyan_area_px": int(largest["area_px"]),
+            "triangulated_point_base": triangulated_point_base,
+            "point_center_optical": point_center_optical,
+            "camera_features": per_camera,
+            "center_feature": center_feature,
         }
+
+    def _desired_point_in_camera(
+        self,
+        camera_info: CameraInfo,
+        desired_uv: tuple[float, float],
+        desired_depth_m: float,
+    ) -> np.ndarray | None:
+        fx = float(camera_info.k[0])
+        fy = float(camera_info.k[4])
+        cx = float(camera_info.k[2])
+        cy = float(camera_info.k[5])
+        if fx <= 1e-6 or fy <= 1e-6 or desired_depth_m <= 1e-6:
+            return None
+        u, v = desired_uv
+        z = float(desired_depth_m)
+        return np.array(
+            [
+                (float(u) - cx) * z / fx,
+                (float(v) - cy) * z / fy,
+                z,
+            ],
+            dtype=float,
+        )
+
+    def _rotate_quat_about_camera_optical(
+        self,
+        quat_wxyz: tuple[float, float, float, float],
+        delta_angle_deg: float,
+        camera_frame: str,
+    ) -> tuple[float, float, float, float] | None:
+        rotation_base_from_optical = self._lookup_camera_rotation_base_from_optical(
+            camera_frame
+        )
+        if rotation_base_from_optical is None:
+            return None
+        rotation_optical_from_base = rotation_base_from_optical.T
+        delta_rad = math.radians(delta_angle_deg)
+        c = math.cos(delta_rad)
+        s = math.sin(delta_rad)
+        rot_optical = np.array(
+            [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+            dtype=float,
+        )
+        rotated = (
+            rotation_base_from_optical
+            @ rot_optical
+            @ rotation_optical_from_base
+            @ quat2mat(quat_wxyz)
+        )
+        quat_rotated = mat2quat(rotated)
+        return (
+            float(quat_rotated[0]),
+            float(quat_rotated[1]),
+            float(quat_rotated[2]),
+            float(quat_rotated[3]),
+        )
+
+    def _estimate_sc_insertion_quat_wxyz(
+        self, observation: Observation | None
+    ) -> tuple[float, float, float, float]:
+        feature = self._sc_center_feature(observation)
+        if feature is None or feature.get("magenta_angle_deg") is None:
+            return self._SC_NOMINAL_QUAT_WXYZ
+        delta_angle_deg = (
+            float(feature["magenta_angle_deg"]) - self._SC_MAGENTA_REFERENCE_ANGLE_DEG
+        )
+        rotated = self._rotate_quat_about_camera_optical(
+            self._SC_NOMINAL_QUAT_WXYZ,
+            delta_angle_deg,
+            self._CENTER_CAMERA_FRAME,
+        )
+        if rotated is None:
+            return self._SC_NOMINAL_QUAT_WXYZ
+        return rotated
 
     def _make_pose(
         self, position_xyz: np.ndarray, quat_wxyz: tuple[float, float, float, float]
@@ -884,7 +1125,19 @@ class QualPhasePilot(Policy):
         get_observation: GetObservationCallback,
         move_robot: MoveRobotCallback,
         debug_run: DebugRun,
+        target_quat_wxyz: tuple[float, float, float, float] | None = None,
+        desired_uv: tuple[float, float] | None = None,
+        desired_area_px: float | None = None,
         max_steps: int = 20,
+        xy_gains: tuple[float, float] = (0.42, 0.52),
+        nominal_depth_m: float = 0.06,
+        depth_gain: float = 0.025,
+        xy_clip_m: float = 0.008,
+        z_clip_m: tuple[float, float] = (-0.008, 0.012),
+        align_tol_px: float = 22.0,
+        area_ratio_tol: float = 0.90,
+        phase_name: str = "submission_sc_servo",
+        settle_phase_name: str = "submission_sc_settle",
     ) -> tuple[Pose | None, Observation | None, dict | None]:
         rotation_base_from_optical = self._lookup_camera_rotation_base_from_optical(
             self._CENTER_CAMERA_FRAME
@@ -896,13 +1149,19 @@ class QualPhasePilot(Policy):
         if initial_feature is None:
             return None, initial_observation, None
 
-        desired_u = 0.5 * float(initial_observation.center_image.width)
-        desired_v = 0.5 * float(initial_observation.center_image.height)
-        desired_area = max(
-            float(initial_feature["cyan_area_px"]) * 1.30,
-            float(initial_feature["cyan_area_px"]) + 4000.0,
-        )
-        desired_area = float(np.clip(desired_area, 10000.0, 45000.0))
+        if desired_uv is None:
+            desired_u = 0.5 * float(initial_observation.center_image.width)
+            desired_v = 0.5 * float(initial_observation.center_image.height)
+        else:
+            desired_u, desired_v = desired_uv
+        if desired_area_px is None:
+            desired_area = max(
+                float(initial_feature["cyan_area_px"]) * 1.30,
+                float(initial_feature["cyan_area_px"]) + 4000.0,
+            )
+            desired_area = float(np.clip(desired_area, 10000.0, 45000.0))
+        else:
+            desired_area = float(desired_area_px)
         last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
 
         observation = initial_observation
@@ -923,12 +1182,12 @@ class QualPhasePilot(Policy):
             dv = union_v - desired_v
             depth_error = (desired_area / max(area_px, 1.0)) - 1.0
             aligned = (
-                abs(du) < 22.0
-                and abs(dv) < 22.0
-                and area_px >= 0.90 * desired_area
+                abs(du) < align_tol_px
+                and abs(dv) < align_tol_px
+                and area_px >= area_ratio_tol * desired_area
             )
             debug_run.log_command_sample(
-                "submission_sc_servo",
+                phase_name,
                 current_pose,
                 self.time_now().nanoseconds / 1e9,
                 note=(
@@ -942,17 +1201,21 @@ class QualPhasePilot(Policy):
 
             delta_cam = np.array(
                 [
-                    0.42 * 0.06 * du / max(fx, 1.0),
-                    0.52 * 0.06 * dv / max(fy, 1.0),
-                    float(np.clip(0.025 * depth_error, -0.008, 0.012)),
+                    xy_gains[0] * nominal_depth_m * du / max(fx, 1.0),
+                    xy_gains[1] * nominal_depth_m * dv / max(fy, 1.0),
+                    float(np.clip(depth_gain * depth_error, z_clip_m[0], z_clip_m[1])),
                 ],
                 dtype=float,
             )
-            delta_cam[0] = float(np.clip(delta_cam[0], -0.008, 0.008))
-            delta_cam[1] = float(np.clip(delta_cam[1], -0.008, 0.008))
+            delta_cam[0] = float(np.clip(delta_cam[0], -xy_clip_m, xy_clip_m))
+            delta_cam[1] = float(np.clip(delta_cam[1], -xy_clip_m, xy_clip_m))
             target_pose = self._make_pose(
                 self._pose_position(current_pose) + (rotation_base_from_optical @ delta_cam),
-                self._quat_xyzw_to_wxyz(current_pose.orientation),
+                (
+                    self._quat_xyzw_to_wxyz(current_pose.orientation)
+                    if target_quat_wxyz is None
+                    else target_quat_wxyz
+                ),
             )
             self._move_for_duration(
                 move_robot,
@@ -960,7 +1223,7 @@ class QualPhasePilot(Policy):
                 target_pose,
                 duration_sec=0.18,
                 debug_run=debug_run,
-                phase_name="submission_sc_servo",
+                phase_name=phase_name,
             )
             best_pose = target_pose
             observation = self._wait_for_observation(
@@ -977,7 +1240,7 @@ class QualPhasePilot(Policy):
             best_pose,
             duration_sec=0.25,
             debug_run=debug_run,
-            phase_name="submission_sc_settle",
+            phase_name=settle_phase_name,
         )
         final_observation = self._wait_for_observation(
             get_observation,
@@ -987,6 +1250,849 @@ class QualPhasePilot(Policy):
         if final_observation is None:
             final_observation = observation
         return best_pose, final_observation, best_feature
+
+    def _run_sc_submission_servo_coarse_to_fine(
+        self,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+    ) -> tuple[Pose | None, Observation | None, dict | None]:
+        coarse_pose, coarse_observation, coarse_feature = self._run_sc_submission_servo(
+            initial_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            desired_uv=self._SC_SUBMISSION_COARSE_TEMPLATE["cyan_centroid_uv"],
+            desired_area_px=self._SC_SUBMISSION_COARSE_TEMPLATE["desired_area_px"],
+            max_steps=24,
+            xy_gains=(0.82, 0.95),
+            nominal_depth_m=self._SC_SUBMISSION_COARSE_TEMPLATE["nominal_depth_m"],
+            depth_gain=0.032,
+            xy_clip_m=0.014,
+            z_clip_m=(-0.012, 0.018),
+            align_tol_px=34.0,
+            area_ratio_tol=0.82,
+            phase_name="submission_sc_coarse_servo",
+            settle_phase_name="submission_sc_coarse_settle",
+        )
+        if coarse_pose is None:
+            return None, coarse_observation, coarse_feature
+
+        fine_input_observation = (
+            coarse_observation if coarse_observation is not None else initial_observation
+        )
+        fine_pose, fine_observation, fine_feature = self._run_sc_submission_servo(
+            fine_input_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            desired_uv=self._SC_SUBMISSION_FINE_TEMPLATE["cyan_centroid_uv"],
+            desired_area_px=self._SC_SUBMISSION_FINE_TEMPLATE["desired_area_px"],
+            max_steps=18,
+            xy_gains=(0.68, 0.82),
+            nominal_depth_m=self._SC_SUBMISSION_FINE_TEMPLATE["nominal_depth_m"],
+            depth_gain=0.028,
+            xy_clip_m=0.010,
+            z_clip_m=(-0.010, 0.014),
+            align_tol_px=28.0,
+            area_ratio_tol=0.80,
+            phase_name="submission_sc_fine_servo",
+            settle_phase_name="submission_sc_fine_settle",
+        )
+        if fine_pose is None:
+            return coarse_pose, coarse_observation, {
+                "coarse_feature": coarse_feature,
+                "fine_feature": fine_feature,
+            }
+        return fine_pose, fine_observation, {
+            "coarse_feature": coarse_feature,
+            "fine_feature": fine_feature,
+        }
+
+    def _run_sc_submission_triangulated_servo(
+        self,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        desired_uv: tuple[float, float],
+        desired_depth_m: float,
+        max_steps: int = 16,
+        position_gain: float = 0.65,
+        max_step_m: float = 0.014,
+        align_tol_px: float = 28.0,
+        depth_tol_m: float = 0.012,
+        rotation_gain: float = 0.45,
+        max_rotation_step_deg: float = 3.0,
+        phase_name: str = "submission_sc_triangulated_servo",
+        settle_phase_name: str = "submission_sc_triangulated_settle",
+    ) -> tuple[Pose | None, Observation | None, dict | None]:
+        triangulated_feature = self._sc_triangulated_feature(initial_observation)
+        if triangulated_feature is None:
+            return None, initial_observation, None
+
+        desired_point_optical = self._desired_point_in_camera(
+            initial_observation.center_camera_info,
+            desired_uv,
+            desired_depth_m,
+        )
+        if desired_point_optical is None:
+            return None, initial_observation, triangulated_feature
+
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        observation = initial_observation
+        best_pose = initial_observation.controller_state.tcp_pose
+        best_feature = triangulated_feature
+
+        for step in range(max_steps):
+            triangulated_feature = self._sc_triangulated_feature(observation)
+            if triangulated_feature is None:
+                break
+            best_feature = triangulated_feature
+            center_feature = triangulated_feature["center_feature"]
+            current_point_optical = triangulated_feature["point_center_optical"]
+            current_pose = observation.controller_state.tcp_pose
+            current_quat_wxyz = self._quat_xyzw_to_wxyz(current_pose.orientation)
+
+            du = float(center_feature["cyan_centroid_uv"][0] - desired_uv[0])
+            dv = float(center_feature["cyan_centroid_uv"][1] - desired_uv[1])
+            depth_error_m = float(current_point_optical[2] - desired_depth_m)
+            angle_error_deg = 0.0
+            magenta_angle_deg = center_feature.get("magenta_angle_deg")
+            if magenta_angle_deg is not None:
+                angle_error_deg = (
+                    float(self._SC_MAGENTA_REFERENCE_ANGLE_DEG)
+                    - float(magenta_angle_deg)
+                )
+            aligned = (
+                abs(du) < align_tol_px
+                and abs(dv) < align_tol_px
+                and abs(depth_error_m) < depth_tol_m
+            )
+            debug_run.log_command_sample(
+                phase_name,
+                current_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"step {step + 1}/{max_steps} du={du:.1f} dv={dv:.1f} "
+                    f"depth={current_point_optical[2]:.3f} desired_depth={desired_depth_m:.3f} "
+                    f"angle_err={angle_error_deg:.2f}"
+                ),
+            )
+            if aligned:
+                best_pose = current_pose
+                break
+
+            center_pose = self._lookup_camera_pose_base_from_optical(
+                self._CENTER_CAMERA_FRAME
+            )
+            if center_pose is None:
+                break
+            rotation_base_from_optical, camera_origin_base = center_pose
+            port_point_base = triangulated_feature["triangulated_point_base"]
+            target_camera_origin_base = (
+                port_point_base - rotation_base_from_optical @ desired_point_optical
+            )
+            delta_base = target_camera_origin_base - camera_origin_base
+            delta_norm = float(np.linalg.norm(delta_base))
+            if delta_norm > max_step_m:
+                delta_base *= max_step_m / delta_norm
+            else:
+                delta_base *= position_gain
+
+            target_quat_wxyz = current_quat_wxyz
+            if rotation_gain > 0.0 and magenta_angle_deg is not None:
+                rotation_step_deg = float(
+                    np.clip(
+                        rotation_gain * angle_error_deg,
+                        -max_rotation_step_deg,
+                        max_rotation_step_deg,
+                    )
+                )
+                rotated_quat = self._rotate_quat_about_camera_optical(
+                    current_quat_wxyz,
+                    rotation_step_deg,
+                    self._CENTER_CAMERA_FRAME,
+                )
+                if rotated_quat is not None:
+                    target_quat_wxyz = rotated_quat
+
+            target_pose = self._make_pose(
+                self._pose_position(current_pose) + delta_base,
+                target_quat_wxyz,
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.18,
+                debug_run=debug_run,
+                phase_name=phase_name,
+            )
+            best_pose = target_pose
+            observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if observation is None:
+                break
+            last_stamp_sec = _stamp_to_float(observation.center_image.header.stamp)
+
+        self._hold_pose(
+            move_robot,
+            best_pose,
+            duration_sec=0.25,
+            debug_run=debug_run,
+            phase_name=settle_phase_name,
+        )
+        final_observation = self._wait_for_observation(
+            get_observation,
+            timeout_sec=0.8,
+            newer_than_sec=last_stamp_sec,
+        )
+        if final_observation is None:
+            final_observation = observation
+        return best_pose, final_observation, best_feature
+
+    def _run_sc_submission_triangulated_coarse_to_fine(
+        self,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        coarse_rotation_gain: float = 0.55,
+        coarse_max_rotation_step_deg: float = 4.0,
+        fine_rotation_gain: float = 0.40,
+        fine_max_rotation_step_deg: float = 2.0,
+    ) -> tuple[Pose | None, Observation | None, dict | None]:
+        coarse_pose, coarse_observation, coarse_feature = (
+            self._run_sc_submission_triangulated_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                desired_uv=self._SC_SUBMISSION_COARSE_TEMPLATE["cyan_centroid_uv"],
+                desired_depth_m=self._SC_SUBMISSION_COARSE_TEMPLATE["nominal_depth_m"],
+                max_steps=18,
+                position_gain=0.75,
+                max_step_m=0.016,
+                align_tol_px=36.0,
+                depth_tol_m=0.016,
+                rotation_gain=coarse_rotation_gain,
+                max_rotation_step_deg=coarse_max_rotation_step_deg,
+                phase_name="submission_sc_triangulated_coarse",
+                settle_phase_name="submission_sc_triangulated_coarse_settle",
+            )
+        )
+        if coarse_pose is None:
+            return None, coarse_observation, coarse_feature
+
+        fine_input_observation = (
+            coarse_observation if coarse_observation is not None else initial_observation
+        )
+        fine_pose, fine_observation, fine_feature = (
+            self._run_sc_submission_triangulated_servo(
+                fine_input_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                desired_uv=self._SC_SUBMISSION_FINE_TEMPLATE["cyan_centroid_uv"],
+                desired_depth_m=self._SC_SUBMISSION_FINE_TEMPLATE["nominal_depth_m"],
+                max_steps=14,
+                position_gain=0.68,
+                max_step_m=0.012,
+                align_tol_px=30.0,
+                depth_tol_m=0.010,
+                rotation_gain=fine_rotation_gain,
+                max_rotation_step_deg=fine_max_rotation_step_deg,
+                phase_name="submission_sc_triangulated_fine",
+                settle_phase_name="submission_sc_triangulated_fine_settle",
+            )
+        )
+        if fine_pose is None:
+            return coarse_pose, coarse_observation, {
+                "coarse_feature": coarse_feature,
+                "fine_feature": fine_feature,
+            }
+        return fine_pose, fine_observation, {
+            "coarse_feature": coarse_feature,
+            "fine_feature": fine_feature,
+        }
+
+    def _run_stage_submission_safe_v3(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "notes": [
+                    "no public-sample world targets",
+                    "no development-only target provider",
+                    "SFP path matches submission_safe_v0",
+                    "SC path triangulates the cyan port feature from wrist cameras",
+                    "SC legal servo couples bounded translation with bounded optical-axis rotation",
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback("submission_v3: SFP center-camera legal servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SFP visual servo using only current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v3 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            send_feedback("submission_v3: SFP bounded tool-axis push")
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short tool-axis insertion push from legal servo pose",
+            )
+            final_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=0.012,
+                duration_sec=0.45,
+                hold_sec=0.8,
+                debug_run=debug_run,
+                phase_prefix="submission_sfp",
+            )
+        else:
+            send_feedback("submission_v3: SC triangulated legal servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SC triangulated visual servo using only current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = (
+                self._run_sc_submission_triangulated_coarse_to_fine(
+                    initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v3 SC servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            baseline_force_norm = self._force_norm(initial_observation)
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short SC tool-axis push followed by bounded legal refinement",
+            )
+            pushed_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SC_TOOL_INSERTION_AXIS,
+                push_distance_m=0.004,
+                duration_sec=0.35,
+                hold_sec=0.25,
+                debug_run=debug_run,
+                phase_prefix="submission_sc",
+            )
+            refined_pose = self._run_sc_force_refine(
+                get_observation,
+                move_robot,
+                debug_run,
+                start_pose=pushed_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+            refined_observation = self._wait_for_observation(
+                get_observation, timeout_sec=0.8
+            )
+            debug_run.save_observation_snapshot(
+                "after_force_refine",
+                refined_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(
+                        task, refined_observation
+                    ),
+                    "feature": self._sc_triangulated_feature(refined_observation),
+                    "refined_pose": _pose_to_dict(refined_pose),
+                },
+            )
+            debug_run.log_phase(
+                "residual",
+                self.time_now().nanoseconds / 1e9,
+                "applying legal SC residual correction",
+            )
+            final_pose = self._run_sc_visual_residual(
+                get_observation,
+                move_robot,
+                debug_run,
+                refined_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=2.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+            },
+        )
+        debug_run.log_phase(
+            "done",
+            self.time_now().nanoseconds / 1e9,
+            "submission_safe_v3 returned True",
+        )
+        debug_run.finalize(
+            True,
+            "submission_safe_v3 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v3 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v4(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "notes": [
+                    "no public-sample world targets",
+                    "no development-only target provider",
+                    "SFP path matches submission_safe_v0",
+                    "SC path triangulates the cyan port feature from wrist cameras",
+                    "SC legal servo uses bounded translation only",
+                    "SC orientation correction is disabled for v3/v4 A-B debugging",
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback("submission_v4: SFP center-camera legal servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SFP visual servo using only current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v4 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            send_feedback("submission_v4: SFP bounded tool-axis push")
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short tool-axis insertion push from legal servo pose",
+            )
+            final_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=0.012,
+                duration_sec=0.45,
+                hold_sec=0.8,
+                debug_run=debug_run,
+                phase_prefix="submission_sfp",
+            )
+        else:
+            send_feedback("submission_v4: SC triangulated translation-only servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SC triangulated translation-only servo using only current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = (
+                self._run_sc_submission_triangulated_coarse_to_fine(
+                    initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    coarse_rotation_gain=0.0,
+                    coarse_max_rotation_step_deg=0.0,
+                    fine_rotation_gain=0.0,
+                    fine_max_rotation_step_deg=0.0,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v4 SC servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            baseline_force_norm = self._force_norm(initial_observation)
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short SC tool-axis push followed by bounded legal refinement",
+            )
+            pushed_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SC_TOOL_INSERTION_AXIS,
+                push_distance_m=0.004,
+                duration_sec=0.35,
+                hold_sec=0.25,
+                debug_run=debug_run,
+                phase_prefix="submission_sc",
+            )
+            refined_pose = self._run_sc_force_refine(
+                get_observation,
+                move_robot,
+                debug_run,
+                start_pose=pushed_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+            refined_observation = self._wait_for_observation(
+                get_observation, timeout_sec=0.8
+            )
+            debug_run.save_observation_snapshot(
+                "after_force_refine",
+                refined_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(
+                        task, refined_observation
+                    ),
+                    "feature": self._sc_triangulated_feature(refined_observation),
+                    "refined_pose": _pose_to_dict(refined_pose),
+                },
+            )
+            debug_run.log_phase(
+                "residual",
+                self.time_now().nanoseconds / 1e9,
+                "applying legal SC residual correction",
+            )
+            final_pose = self._run_sc_visual_residual(
+                get_observation,
+                move_robot,
+                debug_run,
+                refined_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=2.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+            },
+        )
+        debug_run.log_phase(
+            "done",
+            self.time_now().nanoseconds / 1e9,
+            "submission_safe_v4 returned True",
+        )
+        debug_run.finalize(
+            True,
+            "submission_safe_v4 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v4 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v2(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        target_metadata = {
+            "provider": "official_task_and_observation_only",
+            "task_key": list(self._task_key(task)),
+            "notes": [
+                "no public-sample world targets",
+                "no development-only target provider",
+                "SFP path matches submission_safe_v0",
+                "SC path estimates insertion orientation from the observed magenta frame angle",
+            ],
+        }
+        if task.plug_type == "sc":
+            sc_feature = self._sc_center_feature(initial_observation)
+            target_metadata["sc_magenta_angle_deg"] = (
+                None if sc_feature is None else sc_feature.get("magenta_angle_deg")
+            )
+            target_metadata["sc_reference_angle_deg"] = self._SC_MAGENTA_REFERENCE_ANGLE_DEG
+            target_metadata["sc_target_quat_wxyz"] = list(
+                self._estimate_sc_insertion_quat_wxyz(initial_observation)
+            )
+        debug_run.save_target_metadata(target_metadata)
+
+        if task.plug_type == "sfp":
+            send_feedback("submission_v2: SFP center-camera legal servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SFP visual servo using only current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None if aligned_observation is None else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v2 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            send_feedback("submission_v2: SFP bounded tool-axis push")
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short tool-axis insertion push from legal servo pose",
+            )
+            final_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=0.012,
+                duration_sec=0.45,
+                hold_sec=0.8,
+                debug_run=debug_run,
+                phase_prefix="submission_sfp",
+            )
+            success = True
+        else:
+            sc_target_quat = self._estimate_sc_insertion_quat_wxyz(initial_observation)
+            send_feedback("submission_v2: SC legal servo with estimated orientation")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SC visual servo with image-derived insertion orientation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sc_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                target_quat_wxyz=sc_target_quat,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None if aligned_observation is None else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                    "target_quat_wxyz": list(sc_target_quat),
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v2 SC servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            baseline_force_norm = self._force_norm(initial_observation)
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short SC tool-axis push followed by bounded legal refinement",
+            )
+            pushed_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SC_TOOL_INSERTION_AXIS,
+                push_distance_m=0.004,
+                duration_sec=0.35,
+                hold_sec=0.25,
+                debug_run=debug_run,
+                phase_prefix="submission_sc",
+            )
+            refined_pose = self._run_sc_force_refine(
+                get_observation,
+                move_robot,
+                debug_run,
+                start_pose=pushed_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+            debug_run.log_phase(
+                "residual",
+                self.time_now().nanoseconds / 1e9,
+                "applying legal SC residual correction",
+            )
+            final_pose = self._run_sc_visual_residual(
+                get_observation,
+                move_robot,
+                debug_run,
+                refined_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+            success = True
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=2.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+            },
+        )
+        debug_run.log_phase(
+            "done",
+            self.time_now().nanoseconds / 1e9,
+            f"submission_safe_v2 returned {success}",
+        )
+        debug_run.finalize(
+            bool(success),
+            "submission_safe_v2 completed" if success else "submission_safe_v2 failed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v2 artifacts saved to {debug_run.root}")
+        return bool(success)
 
     def _replay_sc_trajectory_with_debug(
         self,
@@ -2764,6 +3870,181 @@ class QualPhasePilot(Policy):
         self.get_logger().info(f"submission_safe_v0 artifacts saved to {debug_run.root}")
         return bool(success)
 
+    def _run_stage_submission_safe_v1(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "notes": [
+                    "no public-sample world targets",
+                    "no development-only target provider",
+                    "SFP path matches submission_safe_v0",
+                    "SC path uses coarse-to-fine task-local sight-picture templates",
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback("submission_v1: SFP center-camera legal servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SFP visual servo using only current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None if aligned_observation is None else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v1 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            send_feedback("submission_v1: SFP bounded tool-axis push")
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short tool-axis insertion push from legal servo pose",
+            )
+            final_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=0.012,
+                duration_sec=0.45,
+                hold_sec=0.8,
+                debug_run=debug_run,
+                phase_prefix="submission_sfp",
+            )
+            success = True
+        else:
+            send_feedback("submission_v1: SC coarse-to-fine legal servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SC coarse-to-fine visual servo using only current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = (
+                self._run_sc_submission_servo_coarse_to_fine(
+                    initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None if aligned_observation is None else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v1 SC servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            baseline_force_norm = self._force_norm(initial_observation)
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short SC tool-axis push followed by bounded legal refinement",
+            )
+            pushed_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SC_TOOL_INSERTION_AXIS,
+                push_distance_m=0.004,
+                duration_sec=0.35,
+                hold_sec=0.25,
+                debug_run=debug_run,
+                phase_prefix="submission_sc",
+            )
+            refined_pose = self._run_sc_force_refine(
+                get_observation,
+                move_robot,
+                debug_run,
+                start_pose=pushed_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+            debug_run.log_phase(
+                "residual",
+                self.time_now().nanoseconds / 1e9,
+                "applying legal SC residual correction",
+            )
+            final_pose = self._run_sc_visual_residual(
+                get_observation,
+                move_robot,
+                debug_run,
+                refined_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+            success = True
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=2.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+            },
+        )
+        debug_run.log_phase(
+            "done",
+            self.time_now().nanoseconds / 1e9,
+            f"submission_safe_v1 returned {success}",
+        )
+        debug_run.finalize(
+            bool(success),
+            "submission_safe_v1 completed" if success else "submission_safe_v1 failed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v1 artifacts saved to {debug_run.root}")
+        return bool(success)
+
     def insert_cable(
         self,
         task: Task,
@@ -2806,6 +4087,22 @@ class QualPhasePilot(Policy):
             )
         if self._stage == "submission_safe_v0":
             return self._run_stage_submission_safe_v0(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v1":
+            return self._run_stage_submission_safe_v1(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v2":
+            return self._run_stage_submission_safe_v2(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v3":
+            return self._run_stage_submission_safe_v3(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v4":
+            return self._run_stage_submission_safe_v4(
                 task, get_observation, move_robot, send_feedback
             )
 

@@ -676,6 +676,7 @@ It should be updated whenever a milestone is completed or blocked.
 | `M6` | force-guided final insertion and recovery | `done` | keep the bounded search, but feed it a better SC pre-insertion pose |
 | `M7` | learned residual near contact | `done` | upgrade SC target acquisition before tuning the residual loop further |
 | `S0` | first end-to-end submission-safe baseline | `done` | keep SFP at this level while improving SC target acquisition without reintroducing dev/public assumptions |
+| `S1` | submission-safe triangulated SC acquisition | `done` | preserve the legal SFP path and keep improving SC final distance without reintroducing runtime target leaks |
 
 ## Executed Milestone Results
 
@@ -694,12 +695,13 @@ The paths below should be the first place to look when a later change regresses.
 | `M6` | `110.0571545895495` | `/home/masa/aic_results/qual_m6_sc_force_refine_20260321_071303/scoring.yaml` | bounded SC force search is implemented and measurable |
 | `M7` | `111.43384153152546` | `/home/masa/aic_results/qual_m7_residual_refine_20260321_073833/scoring.yaml` | fresh-observation gating improves the full stack, but SC perception is still the bottleneck |
 | `S0` | `98.041744964269498` | `/home/masa/aic_results/qual_submission_safe_v0_20260321_151750/scoring.yaml` | first full legal-only baseline; SFP is strong, SC still scores only Tier 1 |
+| `S1` | `122.08548930859087` | `/home/masa/aic_results/qual_submission_safe_v4_20260321_181109/scoring.yaml` | triangulated SC translation-only acquisition lifts the legal path well above `S0`, including nontrivial SC scoring |
 
 ### Current State
 
 As of `2026-03-21`, the milestone stack through `M7` is implemented and has
-representative runs, and the first end-to-end submission-safe baseline exists
-as `S0`.
+representative runs, and the submission-safe track now has both the first
+baseline (`S0`) and a stronger legal follow-up (`S1`).
 
 What is already true:
 
@@ -712,20 +714,22 @@ What is already true:
   official runtime inputs and still score `98.04`
 - `S0` keeps the two SFP trials near the development-oriented baseline:
   `t1=48.06`, `t2=48.98`
+- `S1` raises the submission-safe track to `122.09` while keeping the SFP path
+  stable: `t1=48.72`, `t2=48.99`
+- `S1` is the first legal-only run where the SC trial scores substantially
+  above Tier 1: `trial_3=24.38`
 
 What is not true yet:
 
-- the best overall score is still the development-oriented `M7` result, not the
-  submission-safe path
-- `S0` still leaves SC at pure Tier 1 (`t3=1.0`, final plug-port distance
-  `0.20 m`)
-- further force/residual tuning is not the main bottleneck; legal SC
-  target-local acquisition is
+- the submission-safe path still does not achieve SC insertion
+- `S1` still leaves the SC final plug-port distance at `0.16 m`
+- further force/residual tuning is no longer the first blocker; the next gain
+  still depends on a better legal SC pre-insertion pose
 
 ### Historical Blocking Issue
 
 As of `2026-03-21`, the development milestones are no longer the main blocker.
-The current blocker is the gap between `S0` and a submission-safe SC-scoring
+The current blocker is the gap between `S1` and a submission-safe SC insertion
 path.
 
 What is already true:
@@ -735,17 +739,19 @@ What is already true:
 - `M2` proved the legal SFP localizer moves toward the correct module
 - `S0` proved that legal-only runtime inputs are sufficient for strong SFP
   scoring on both public sample SFP trials
+- `S1` proved that legal-only multi-camera SC acquisition can produce real SC
+  score without `_DEV_TARGETS` or public-sample world targets
 
 What is not true yet:
 
-- the current legal SC path does not get within scoring radius reliably enough
-  to unlock Tier 2/Tier 3
-- the legal SC center-camera servo plus bounded force/residual loop still ends
-  around `0.20 m` from the target on the representative run
+- the current legal SC path does not get close enough to reliably convert the
+  SC trial into insertion
+- the best legal SC run still ends around `0.16 m` from the target port on the
+  representative run
 
 Therefore the next work item is not more public-sample tuning.
-The next work item is to keep `S0` as the legal baseline and replace only the
-SC acquisition stage.
+The next work item is to keep `S1` as the legal baseline and improve only the
+SC pre-insertion alignment and final approach.
 
 ### Submission-Safe Track
 
@@ -804,6 +810,60 @@ Next gate:
 
 - implement a better legal SC acquisition stage while preserving the current
   `S0` SFP score band
+
+#### S1. Submission-Safe Triangulated SC Translation-Only Acquisition
+
+Purpose:
+
+- keep the legal SFP path from `S0`
+- replace the weak SC center-camera acquisition with a multi-camera legal
+  triangulation step
+- isolate whether SC optical-axis rotation correction is helping or hurting
+
+Representative result:
+
+- stage: `submission_safe_v4`
+- score total: `122.08548930859087`
+- score by trial:
+  - `trial_1 = 48.72334879624358`
+  - `trial_2 = 48.987096754294114`
+  - `trial_3 = 24.375043758053183`
+- artifacts:
+  - `/home/masa/aic_results/qual_submission_safe_v4_20260321_181109/scoring.yaml`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_181301_submission_safe_v4_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_181719_submission_safe_v4_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_182141_submission_safe_v4_task_1`
+
+What it uses:
+
+- the same legal SFP center-camera servo as `S0`
+- SC cyan-feature triangulation from the left / center / right wrist cameras
+- bounded translation-only SC acquisition with optical-axis rotation disabled
+- bounded SC force refine and visual residual on top of the new legal
+  pre-insertion pose
+
+What it proved:
+
+- the legal-only track can now beat the development-oriented `M7` result
+  without reintroducing `_DEV_TARGETS` or public-sample world targets
+- disabling the SC optical-axis rotation heuristic is better than the coupled
+  `v3` rotation path for this run family
+- the SC trial can score materially (`24.38`) even without insertion when the
+  pre-insertion pose is improved
+
+What still fails:
+
+- SC still does not insert
+- the representative SC trial still ends at `0.16 m`, so the legal
+  pre-insertion pose is better but not yet tight enough
+- the SC runtime is still longer than desired (`19.00 s`) because the force and
+  residual phases are doing corrective work that should move upstream
+
+Next gate:
+
+- preserve the `S1` SFP scores while tightening SC final distance below the
+  current `0.16 m`
+- improve SC pre-insertion alignment before adding more downstream force logic
 
 ### M0. Observability Harness
 

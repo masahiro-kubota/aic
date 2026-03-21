@@ -267,3 +267,30 @@ It should stay concise enough to scan quickly.
   - `the dominant bottleneck is now legal SC target acquisition, not downstream force/residual logic`
 - Next action:
   - `preserve the S0 SFP path and replace only the SC acquisition stage with a stronger legal localizer`
+
+## 2026-03-21 18:30 JST - S1 Submission-Safe Triangulated SC Translation-Only Acquisition
+
+- Commit: `uncommitted`
+- Milestone: `S1`
+- Submission-safe: `yes`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=submission_safe_v4`, GUI eval via `/entrypoint.sh`, `ground_truth:=false`, `DISPLAY=:1`
+- Score total: `122.08548930859087`
+- Score by trial: `t1=48.72334879624358`, `t2=48.987096754294114`, `t3=24.375043758053183`
+- Artifacts:
+  - `/home/masa/aic_results/qual_submission_safe_v4_20260321_181109/scoring.yaml`
+  - `/home/masa/aic_results/qual_submission_safe_v4_20260321_181109/eval.log`
+  - `/home/masa/aic_results/qual_submission_safe_v4_20260321_181109/model.log`
+  - `/home/masa/aic_results/qual_submission_safe_v4_20260321_181109/debug_dirs.txt`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_181301_submission_safe_v4_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_181719_submission_safe_v4_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_182141_submission_safe_v4_task_1`
+- What worked:
+  - `the legal-only path now scores above both S0 and the development-oriented M7 reference`
+  - `keeping triangulated SC translation but disabling the SC optical-axis rotation heuristic materially improved the SC trial`
+  - `SFP stayed stable while SC rose from Tier 1 only to a 24.38-point trial`
+- What failed:
+  - `SC still did not insert and finished 0.16 m from the target port`
+  - `the SC path still spends too long in force/residual cleanup, which means the pre-insertion pose is better but not yet good enough`
+- Next action:
+  - `treat S1 as the new legal baseline and focus the next changes on tightening SC pre-insertion distance before adding more downstream complexity`
