@@ -237,3 +237,33 @@ It should stay concise enough to scan quickly.
   - `SC regressed to a final distance of 0.32 m on this representative run, so the residual controller still needs better target acquisition rather than more downstream pushing`
 - Next action:
   - `replace the dev/public-sample SC alignment with a legal target-local SC perception stage before trying more force or residual logic`
+
+## 2026-03-21 15:38 JST - S0 First End-To-End Submission-Safe Baseline
+
+- Commit: `uncommitted`
+- Milestone: `S0`
+- Submission-safe: `yes`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=submission_safe_v0`, GUI eval via `/entrypoint.sh`, `ground_truth:=false`, `DISPLAY=:1`
+- Score total: `98.041744964269498`
+- Score by trial: `t1=48.061318260132214`, `t2=48.980426704591785`, `t3=1.0`
+- Artifacts:
+  - `/home/masa/aic_results/qual_submission_safe_v0_20260321_151750/scoring.yaml`
+  - `/home/masa/aic_results/qual_submission_safe_v0_20260321_151750/eval.log`
+  - `/home/masa/aic_results/qual_submission_safe_v0_20260321_151750/model.log`
+  - `/home/masa/aic_results/qual_submission_safe_v0_20260321_151750/debug_dirs.txt`
+  - `/home/masa/aic_results/bag_trial_1_20260321_151941_882`
+  - `/home/masa/aic_results/bag_trial_2_20260321_152407_545`
+  - `/home/masa/aic_results/bag_trial_3_20260321_152831_017`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_151944_submission_safe_v0_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_152410_submission_safe_v0_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_152833_submission_safe_v0_task_1`
+- What worked:
+  - `the run completed all 3 trials using only official runtime inputs`
+  - `SFP stayed strong without public-sample world targets, scoring about 48 on both trials`
+  - `debug artifacts clearly record the legal-only target provider and per-phase snapshots`
+- What failed:
+  - `SC still earned only Tier 1 and finished 0.20 m from the target port`
+  - `the dominant bottleneck is now legal SC target acquisition, not downstream force/residual logic`
+- Next action:
+  - `preserve the S0 SFP path and replace only the SC acquisition stage with a stronger legal localizer`

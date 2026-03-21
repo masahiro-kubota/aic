@@ -675,6 +675,7 @@ It should be updated whenever a milestone is completed or blocked.
 | `M5` | multi-camera late fusion | `done` | preserve the M5 SFP gain while making SC more legal |
 | `M6` | force-guided final insertion and recovery | `done` | keep the bounded search, but feed it a better SC pre-insertion pose |
 | `M7` | learned residual near contact | `done` | upgrade SC target acquisition before tuning the residual loop further |
+| `S0` | first end-to-end submission-safe baseline | `done` | keep SFP at this level while improving SC target acquisition without reintroducing dev/public assumptions |
 
 ## Executed Milestone Results
 
@@ -692,11 +693,13 @@ The paths below should be the first place to look when a later change regresses.
 | `M5` | `109.96488164803876` | `/home/masa/aic_results/qual_m5_multi_camera_late_fusion_20260321_064904/scoring.yaml` | multi-camera SFP refinement gives a clear gain |
 | `M6` | `110.0571545895495` | `/home/masa/aic_results/qual_m6_sc_force_refine_20260321_071303/scoring.yaml` | bounded SC force search is implemented and measurable |
 | `M7` | `111.43384153152546` | `/home/masa/aic_results/qual_m7_residual_refine_20260321_073833/scoring.yaml` | fresh-observation gating improves the full stack, but SC perception is still the bottleneck |
+| `S0` | `98.041744964269498` | `/home/masa/aic_results/qual_submission_safe_v0_20260321_151750/scoring.yaml` | first full legal-only baseline; SFP is strong, SC still scores only Tier 1 |
 
 ### Current State
 
 As of `2026-03-21`, the milestone stack through `M7` is implemented and has
-representative runs.
+representative runs, and the first end-to-end submission-safe baseline exists
+as `S0`.
 
 What is already true:
 
@@ -705,34 +708,102 @@ What is already true:
   `M4 -> M5 -> M6 -> M7 = 93.08 -> 109.96 -> 110.06 -> 111.43`
 - fresh-observation gating and sim-time pacing improved the reliability of the
   SFP stages
+- `S0` proves that the same policy can complete all 3 trials using only
+  official runtime inputs and still score `98.04`
+- `S0` keeps the two SFP trials near the development-oriented baseline:
+  `t1=48.06`, `t2=48.98`
 
 What is not true yet:
 
-- the legal path is still blocked at `M3`; the submission-safe SFP insertion
-  baseline is not good enough yet
-- the current SC path is still development-oriented and does not earn SC points
-- further force/residual tuning is not the main bottleneck anymore; target-local
-  SC perception is
+- the best overall score is still the development-oriented `M7` result, not the
+  submission-safe path
+- `S0` still leaves SC at pure Tier 1 (`t3=1.0`, final plug-port distance
+  `0.20 m`)
+- further force/residual tuning is not the main bottleneck; legal SC
+  target-local acquisition is
 
 ### Historical Blocking Issue
 
-As of `2026-03-21`, the plan is blocked at `M3`.
+As of `2026-03-21`, the development milestones are no longer the main blocker.
+The current blocker is the gap between `S0` and a submission-safe SC-scoring
+path.
 
 What is already true:
 
 - `M0` exists and saves usable debug artifacts
 - `M1` proved the controller state machine can score on at least one SFP trial
 - `M2` proved the legal SFP localizer moves toward the correct module
+- `S0` proved that legal-only runtime inputs are sufficient for strong SFP
+  scoring on both public sample SFP trials
 
 What is not true yet:
 
-- the `M2` localizer does not yet deliver a strong enough pre-insertion pose for
-  the `M3` fixed insertion step
-- the current `M3` insertion push preserves legality, but still scores like pure
-  Tier 1 on the representative run
+- the current legal SC path does not get within scoring radius reliably enough
+  to unlock Tier 2/Tier 3
+- the legal SC center-camera servo plus bounded force/residual loop still ends
+  around `0.20 m` from the target on the representative run
 
-Therefore the next work item is not `M4` or `M6`.
-The next work item is to fix `M3` until SFP becomes a reliable, legal baseline.
+Therefore the next work item is not more public-sample tuning.
+The next work item is to keep `S0` as the legal baseline and replace only the
+SC acquisition stage.
+
+### Submission-Safe Track
+
+The development-oriented milestones `M0` through `M7` were useful because they
+made the controller phases and failure modes visible.
+However, the submission target must now be tracked separately.
+
+#### S0. First End-To-End Submission-Safe Baseline
+
+Purpose:
+
+- prove that the entire 3-trial run can complete using only `Task` and
+  `Observation` at runtime
+- preserve the strong SFP behavior while removing all dev/public target
+  dependencies
+- establish the first trustworthy legal baseline for further work
+
+Representative result:
+
+- stage: `submission_safe_v0`
+- score total: `98.041744964269498`
+- score by trial:
+  - `trial_1 = 48.061318260132214`
+  - `trial_2 = 48.980426704591785`
+  - `trial_3 = 1.0`
+- artifacts:
+  - `/home/masa/aic_results/qual_submission_safe_v0_20260321_151750/scoring.yaml`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_151944_submission_safe_v0_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_152410_submission_safe_v0_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_152833_submission_safe_v0_task_1`
+
+What it uses:
+
+- center-camera SFP servo driven only by image-space features from the current
+  observation
+- center-camera SC servo driven only by current observation masks
+- short tool-axis push derived from the current TCP orientation
+- bounded SC force refine and visual residual, but without `_DEV_TARGETS`,
+  `PublicTrialPosePilot._TARGETS`, or replay trajectories
+
+What it proved:
+
+- the first two SFP trials do not need public-sample world targets to score
+  near `49` each
+- the legal-only path can complete all trials and generate debug artifacts
+  cleanly
+- the dominant remaining bottleneck is isolated to SC acquisition, not SFP
+
+What still fails:
+
+- the SC path still scores only Tier 1 and finishes at `0.20 m`
+- the SC residual logic is now downstream of the real problem; it needs a
+  better legal pre-insertion pose
+
+Next gate:
+
+- implement a better legal SC acquisition stage while preserving the current
+  `S0` SFP score band
 
 ### M0. Observability Harness
 

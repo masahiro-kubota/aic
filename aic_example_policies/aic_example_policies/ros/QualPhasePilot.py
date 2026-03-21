@@ -348,6 +348,16 @@ class QualPhasePilot(Policy):
         "cyan_centroid_uv": (626.4, 759.0),
         "nominal_depth_m": 0.055,
     }
+    _SFP_TOOL_INSERTION_AXIS = (
+        0.000159431701,
+        -0.350186974,
+        0.936679805,
+    )
+    _SC_TOOL_INSERTION_AXIS = (
+        0.43965921,
+        -0.45945677,
+        0.77175077,
+    )
     _SFP_INSERTION_VECTOR_BASE = (0.0, -0.000579, -0.045797)
     _DEV_TARGETS = {
         ("sfp", "nic_card_mount_0", "sfp_port_0"): PhaseTarget(
@@ -713,6 +723,270 @@ class QualPhasePilot(Policy):
             return 0.0
         force = observation.wrist_wrench.wrench.force
         return float(np.linalg.norm([force.x, force.y, force.z]))
+
+    def _tool_axis_in_base(
+        self,
+        pose: Pose,
+        axis_tool: tuple[float, float, float],
+    ) -> np.ndarray:
+        axis_tool_np = np.array(axis_tool, dtype=float)
+        axis_tool_np /= max(np.linalg.norm(axis_tool_np), 1e-6)
+        return quat2mat(self._quat_xyzw_to_wxyz(pose.orientation)) @ axis_tool_np
+
+    def _run_tool_axis_push(
+        self,
+        move_robot: MoveRobotCallback,
+        start_pose: Pose,
+        axis_tool: tuple[float, float, float],
+        push_distance_m: float,
+        duration_sec: float,
+        hold_sec: float,
+        debug_run: DebugRun,
+        phase_prefix: str,
+    ) -> Pose:
+        axis_base = self._tool_axis_in_base(start_pose, axis_tool)
+        axis_base /= max(np.linalg.norm(axis_base), 1e-6)
+        pushed_pose = self._make_pose(
+            self._pose_position(start_pose) + push_distance_m * axis_base,
+            self._quat_xyzw_to_wxyz(start_pose.orientation),
+        )
+        self._move_for_duration(
+            move_robot,
+            start_pose,
+            pushed_pose,
+            duration_sec=duration_sec,
+            debug_run=debug_run,
+            phase_name=f"{phase_prefix}_push",
+        )
+        self._hold_pose(
+            move_robot,
+            pushed_pose,
+            duration_sec=hold_sec,
+            debug_run=debug_run,
+            phase_name=f"{phase_prefix}_hold",
+        )
+        return pushed_pose
+
+    def _run_sfp_submission_servo(
+        self,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        max_steps: int = 24,
+    ) -> tuple[Pose | None, Observation | None, dict | None]:
+        rotation_base_from_optical = self._lookup_camera_rotation_base_from_optical(
+            self._CENTER_CAMERA_FRAME
+        )
+        if rotation_base_from_optical is None:
+            return None, None, None
+
+        initial_feature = self._sfp_union_feature(initial_observation)
+        if initial_feature is None:
+            return None, initial_observation, None
+
+        desired_u = 0.5 * float(initial_observation.center_image.width)
+        desired_v = 0.5 * float(initial_observation.center_image.height)
+        desired_height = max(
+            float(initial_feature["union_size_px"][1]) * 1.35,
+            float(initial_feature["union_size_px"][1]) + 60.0,
+        )
+        desired_height = float(np.clip(desired_height, 180.0, 360.0))
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+
+        observation = initial_observation
+        best_pose = initial_observation.controller_state.tcp_pose
+        best_feature = initial_feature
+
+        for step in range(max_steps):
+            feature = self._sfp_union_feature(observation)
+            if feature is None:
+                break
+            best_feature = feature
+            current_pose = observation.controller_state.tcp_pose
+            fx = float(observation.center_camera_info.k[0])
+            fy = float(observation.center_camera_info.k[4])
+            union_u, union_v = feature["union_center_uv"]
+            _, union_h = feature["union_size_px"]
+            du = union_u - desired_u
+            dv = union_v - desired_v
+            depth_scale = desired_height / max(union_h, 1.0)
+            depth_error = depth_scale - 1.0
+            aligned = (
+                abs(du) < 18.0
+                and abs(dv) < 18.0
+                and union_h >= 0.92 * desired_height
+            )
+            debug_run.log_command_sample(
+                "submission_sfp_servo",
+                current_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"step {step + 1}/{max_steps} du={du:.1f} dv={dv:.1f} "
+                    f"height={union_h:.1f} desired_height={desired_height:.1f}"
+                ),
+            )
+            if aligned:
+                best_pose = current_pose
+                break
+
+            delta_cam = np.array(
+                [
+                    0.55 * 0.06 * du / max(fx, 1.0),
+                    0.70 * 0.06 * dv / max(fy, 1.0),
+                    float(np.clip(0.035 * depth_error, -0.015, 0.02)),
+                ],
+                dtype=float,
+            )
+            delta_cam[0] = float(np.clip(delta_cam[0], -0.012, 0.012))
+            delta_cam[1] = float(np.clip(delta_cam[1], -0.012, 0.012))
+            target_pose = self._make_pose(
+                self._pose_position(current_pose) + (rotation_base_from_optical @ delta_cam),
+                self._quat_xyzw_to_wxyz(current_pose.orientation),
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.18,
+                debug_run=debug_run,
+                phase_name="submission_sfp_servo",
+            )
+            best_pose = target_pose
+            observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if observation is None:
+                break
+            last_stamp_sec = _stamp_to_float(observation.center_image.header.stamp)
+
+        self._hold_pose(
+            move_robot,
+            best_pose,
+            duration_sec=0.25,
+            debug_run=debug_run,
+            phase_name="submission_sfp_settle",
+        )
+        final_observation = self._wait_for_observation(
+            get_observation,
+            timeout_sec=0.8,
+            newer_than_sec=last_stamp_sec,
+        )
+        if final_observation is None:
+            final_observation = observation
+        return best_pose, final_observation, best_feature
+
+    def _run_sc_submission_servo(
+        self,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        max_steps: int = 20,
+    ) -> tuple[Pose | None, Observation | None, dict | None]:
+        rotation_base_from_optical = self._lookup_camera_rotation_base_from_optical(
+            self._CENTER_CAMERA_FRAME
+        )
+        if rotation_base_from_optical is None:
+            return None, None, None
+
+        initial_feature = self._sc_center_feature(initial_observation)
+        if initial_feature is None:
+            return None, initial_observation, None
+
+        desired_u = 0.5 * float(initial_observation.center_image.width)
+        desired_v = 0.5 * float(initial_observation.center_image.height)
+        desired_area = max(
+            float(initial_feature["cyan_area_px"]) * 1.30,
+            float(initial_feature["cyan_area_px"]) + 4000.0,
+        )
+        desired_area = float(np.clip(desired_area, 10000.0, 45000.0))
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+
+        observation = initial_observation
+        best_pose = initial_observation.controller_state.tcp_pose
+        best_feature = initial_feature
+
+        for step in range(max_steps):
+            feature = self._sc_center_feature(observation)
+            if feature is None:
+                break
+            best_feature = feature
+            current_pose = observation.controller_state.tcp_pose
+            fx = float(observation.center_camera_info.k[0])
+            fy = float(observation.center_camera_info.k[4])
+            union_u, union_v = feature["cyan_centroid_uv"]
+            area_px = float(feature["cyan_area_px"])
+            du = union_u - desired_u
+            dv = union_v - desired_v
+            depth_error = (desired_area / max(area_px, 1.0)) - 1.0
+            aligned = (
+                abs(du) < 22.0
+                and abs(dv) < 22.0
+                and area_px >= 0.90 * desired_area
+            )
+            debug_run.log_command_sample(
+                "submission_sc_servo",
+                current_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"step {step + 1}/{max_steps} du={du:.1f} dv={dv:.1f} "
+                    f"area={area_px:.0f} desired_area={desired_area:.0f}"
+                ),
+            )
+            if aligned:
+                best_pose = current_pose
+                break
+
+            delta_cam = np.array(
+                [
+                    0.42 * 0.06 * du / max(fx, 1.0),
+                    0.52 * 0.06 * dv / max(fy, 1.0),
+                    float(np.clip(0.025 * depth_error, -0.008, 0.012)),
+                ],
+                dtype=float,
+            )
+            delta_cam[0] = float(np.clip(delta_cam[0], -0.008, 0.008))
+            delta_cam[1] = float(np.clip(delta_cam[1], -0.008, 0.008))
+            target_pose = self._make_pose(
+                self._pose_position(current_pose) + (rotation_base_from_optical @ delta_cam),
+                self._quat_xyzw_to_wxyz(current_pose.orientation),
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.18,
+                debug_run=debug_run,
+                phase_name="submission_sc_servo",
+            )
+            best_pose = target_pose
+            observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if observation is None:
+                break
+            last_stamp_sec = _stamp_to_float(observation.center_image.header.stamp)
+
+        self._hold_pose(
+            move_robot,
+            best_pose,
+            duration_sec=0.25,
+            debug_run=debug_run,
+            phase_name="submission_sc_settle",
+        )
+        final_observation = self._wait_for_observation(
+            get_observation,
+            timeout_sec=0.8,
+            newer_than_sec=last_stamp_sec,
+        )
+        if final_observation is None:
+            final_observation = observation
+        return best_pose, final_observation, best_feature
 
     def _replay_sc_trajectory_with_debug(
         self,
@@ -2318,6 +2592,178 @@ class QualPhasePilot(Policy):
         self.get_logger().info(f"M7 artifacts saved to {debug_run.root}")
         return bool(success)
 
+    def _run_stage_submission_safe_v0(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "notes": [
+                    "no public-sample world targets",
+                    "no development-only target provider",
+                    "tool-axis push derived from grasp-relative TCP motion",
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback("submission_v0: SFP center-camera legal servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SFP visual servo using only current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None if aligned_observation is None else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v0 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            send_feedback("submission_v0: SFP bounded tool-axis push")
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short tool-axis insertion push from legal servo pose",
+            )
+            final_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=0.012,
+                duration_sec=0.45,
+                hold_sec=0.8,
+                debug_run=debug_run,
+                phase_prefix="submission_sfp",
+            )
+            success = True
+        else:
+            send_feedback("submission_v0: SC center-camera legal servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running SC visual servo using only current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sc_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None if aligned_observation is None else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v0 SC servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            baseline_force_norm = self._force_norm(initial_observation)
+            debug_run.log_phase(
+                "insert",
+                self.time_now().nanoseconds / 1e9,
+                "applying short SC tool-axis push followed by bounded legal refinement",
+            )
+            pushed_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SC_TOOL_INSERTION_AXIS,
+                push_distance_m=0.004,
+                duration_sec=0.35,
+                hold_sec=0.25,
+                debug_run=debug_run,
+                phase_prefix="submission_sc",
+            )
+            refined_pose = self._run_sc_force_refine(
+                get_observation,
+                move_robot,
+                debug_run,
+                start_pose=pushed_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+            debug_run.log_phase(
+                "residual",
+                self.time_now().nanoseconds / 1e9,
+                "applying legal SC residual correction",
+            )
+            final_pose = self._run_sc_visual_residual(
+                get_observation,
+                move_robot,
+                debug_run,
+                refined_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+            success = True
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=2.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+            },
+        )
+        debug_run.log_phase(
+            "done",
+            self.time_now().nanoseconds / 1e9,
+            f"submission_safe_v0 returned {success}",
+        )
+        debug_run.finalize(
+            bool(success),
+            "submission_safe_v0 completed" if success else "submission_safe_v0 failed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v0 artifacts saved to {debug_run.root}")
+        return bool(success)
+
     def insert_cable(
         self,
         task: Task,
@@ -2356,6 +2802,10 @@ class QualPhasePilot(Policy):
             )
         if self._stage == "m7_residual_refine":
             return self._run_stage_m7_residual_refine(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v0":
+            return self._run_stage_submission_safe_v0(
                 task, get_observation, move_robot, send_feedback
             )
 
