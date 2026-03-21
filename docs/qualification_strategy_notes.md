@@ -677,6 +677,7 @@ It should be updated whenever a milestone is completed or blocked.
 | `M7` | learned residual near contact | `done` | upgrade SC target acquisition before tuning the residual loop further |
 | `S0` | first end-to-end submission-safe baseline | `done` | keep SFP at this level while improving SC target acquisition without reintroducing dev/public assumptions |
 | `S1` | submission-safe triangulated SC acquisition | `done` | preserve the legal SFP path and keep improving SC final distance without reintroducing runtime target leaks |
+| `S2` | submission-safe learned SC acquisition | `done` | keep the learned SC gain while replacing hand-picked teacher templates with a cleaner legal target representation |
 
 ## Executed Milestone Results
 
@@ -696,12 +697,14 @@ The paths below should be the first place to look when a later change regresses.
 | `M7` | `111.43384153152546` | `/home/masa/aic_results/qual_m7_residual_refine_20260321_073833/scoring.yaml` | fresh-observation gating improves the full stack, but SC perception is still the bottleneck |
 | `S0` | `98.041744964269498` | `/home/masa/aic_results/qual_submission_safe_v0_20260321_151750/scoring.yaml` | first full legal-only baseline; SFP is strong, SC still scores only Tier 1 |
 | `S1` | `122.08548930859087` | `/home/masa/aic_results/qual_submission_safe_v4_20260321_181109/scoring.yaml` | triangulated SC translation-only acquisition lifts the legal path well above `S0`, including nontrivial SC scoring |
+| `S2` | `126.58206055565613` | `/home/masa/aic_results/qual_submission_safe_v6_20260321_220649/scoring.yaml` | learned multi-view SC acquisition becomes the new legal best while preserving strong SFP performance |
 
 ### Current State
 
 As of `2026-03-21`, the milestone stack through `M7` is implemented and has
-representative runs, and the submission-safe track now has both the first
-baseline (`S0`) and a stronger legal follow-up (`S1`).
+representative runs, and the submission-safe track now has three concrete
+reference points: the first legal baseline (`S0`), the triangulated SC upgrade
+(`S1`), and the current best learned-SC run (`S2`).
 
 What is already true:
 
@@ -718,18 +721,22 @@ What is already true:
   stable: `t1=48.72`, `t2=48.99`
 - `S1` is the first legal-only run where the SC trial scores substantially
   above Tier 1: `trial_3=24.38`
+- `S2` raises the legal best to `126.58` with `trial_3=29.39` while keeping the
+  two SFP trials in the same strong band: `t1=48.21`, `t2=48.98`
+- the learned SC acquisition in `S2` is the first legal-only path in this repo
+  that clearly beats the triangulated `S1` baseline on total score
 
 What is not true yet:
 
 - the submission-safe path still does not achieve SC insertion
-- `S1` still leaves the SC final plug-port distance at `0.16 m`
+- `S2` still leaves the SC final plug-port distance at `0.13 m`
 - further force/residual tuning is no longer the first blocker; the next gain
   still depends on a better legal SC pre-insertion pose
 
 ### Historical Blocking Issue
 
 As of `2026-03-21`, the development milestones are no longer the main blocker.
-The current blocker is the gap between `S1` and a submission-safe SC insertion
+The current blocker is the gap between `S2` and a submission-safe SC insertion
 path.
 
 What is already true:
@@ -741,17 +748,36 @@ What is already true:
   scoring on both public sample SFP trials
 - `S1` proved that legal-only multi-camera SC acquisition can produce real SC
   score without `_DEV_TARGETS` or public-sample world targets
+- `S2` proved that learned legal SC acquisition can beat the best hand-crafted
+  legal baseline without sacrificing the strong SFP path
 
 What is not true yet:
 
 - the current legal SC path does not get close enough to reliably convert the
   SC trial into insertion
-- the best legal SC run still ends around `0.16 m` from the target port on the
+- the best legal SC run still ends around `0.13 m` from the target port on the
   representative run
 
 Therefore the next work item is not more public-sample tuning.
-The next work item is to keep `S1` as the legal baseline and improve only the
+The next work item is to keep `S2` as the legal baseline and improve only the
 SC pre-insertion alignment and final approach.
+
+### Rejected Probe: X1 Tool-Frame Force Search
+
+One small legal follow-up was tested after `S2`:
+
+- `submission_safe_v8` added a bounded tool-frame force search after the
+  learned SC acquisition
+- in SC-only fail-fast mode it improved the isolated SC score to `33.40`
+  (`/home/masa/aic_results/qual_submission_safe_v8_20260321_222558/scoring.yaml`)
+- however, the corresponding full-run probe regressed the second SFP trial to
+  `41.90`, so the branch was not promoted
+
+Current conclusion:
+
+- keep `S2` as the winning baseline
+- do not spend more time on `v8` unless its time cost and cross-trial coupling
+  are explained first
 
 ### Submission-Safe Track
 

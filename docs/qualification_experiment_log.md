@@ -294,3 +294,52 @@ It should stay concise enough to scan quickly.
   - `the SC path still spends too long in force/residual cleanup, which means the pre-insertion pose is better but not yet good enough`
 - Next action:
   - `treat S1 as the new legal baseline and focus the next changes on tightening SC pre-insertion distance before adding more downstream complexity`
+
+## 2026-03-21 22:25 JST - S2 Submission-Safe Learned SC Acquisition
+
+- Commit: `uncommitted`
+- Milestone: `S2`
+- Submission-safe: `yes`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=submission_safe_v6`, headless eval via `/entrypoint.sh`, `ground_truth:=false`, `DISPLAY=:1`, learned SC model `sc_uvz_v1`
+- Score total: `126.58206055565613`
+- Score by trial: `t1=48.21030515038397`, `t2=48.982548911699574`, `t3=29.389206493572582`
+- Artifacts:
+  - `/home/masa/aic_results/qual_submission_safe_v6_20260321_220649/scoring.yaml`
+  - `/home/masa/aic_results/qual_submission_safe_v6_20260321_220649/eval.log`
+  - `/home/masa/aic_results/qual_submission_safe_v6_20260321_220649/model.log`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_220845_submission_safe_v6_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_221302_submission_safe_v6_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_221726_submission_safe_v6_task_1`
+- What worked:
+  - `the learned multi-view SC acquisition beat the previous legal best S1 and raised the overall score above 126`
+  - `both SFP trials stayed near 48 points while the SC trial climbed to 29.39 without using DEV_TARGETS or public-sample world targets`
+  - `switching _wait_for_observation to wall-clock timeout removed the sim-time stall that had made the v6/v7 runs hang`
+- What failed:
+  - `SC still did not insert; the final plug-port distance was 0.13 m`
+  - `the learned SC stage still relies on hand-picked desired image/depth templates extracted from GT teacher data`
+- Next action:
+  - `treat S2 as the new winning legal baseline and test only small legal post-acquisition refinements against it`
+
+## 2026-03-21 22:35 JST - X1 Legal Tool-Frame Force Search Probe
+
+- Commit: `uncommitted`
+- Milestone: `X1`
+- Submission-safe: `yes`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=submission_safe_v8`, SC-only fail-fast config `/home/masa/ws_aic/src/aic/aic_engine/config/learn_collect_sc_only.yaml`, headless eval via `/entrypoint.sh`, `ground_truth:=false`, `DISPLAY=:1`
+- Score total: `33.404680405165706`
+- Score by trial: `t1=33.404680405165706`
+- Artifacts:
+  - `/home/masa/aic_results/qual_submission_safe_v8_20260321_222558/scoring.yaml`
+  - `/home/masa/aic_results/qual_submission_safe_v8_20260321_222558/eval.log`
+  - `/home/masa/aic_results/qual_submission_safe_v8_20260321_222558/model.log`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260321_222753_submission_safe_v8_task_1`
+- What worked:
+  - `adding a legal tool-frame bounded force search improved the isolated SC trial over S2's trial_3 score band`
+  - `the SC-only run finished at 0.10 m final distance, which is better than the S2 representative full-run SC result`
+- What failed:
+  - `the tool-frame force search is too slow to be a good fail-fast refinement`
+  - `a follow-up full-run probe started with the same v8 code but reached only 48.949048 + 41.896870 = 90.845918 after the first two SFP trials, meaning trial_3 would have needed 35.73614255565613 points just to match S2; that was already above the SC-only v8 result, so the run was aborted`
+- Next action:
+  - `keep S2 as the promoted best run and do not advance v8 without reducing its time cost and explaining the unexpected SFP regression`
