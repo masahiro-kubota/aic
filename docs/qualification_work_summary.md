@@ -18,6 +18,87 @@
 [qualification_strategy_notes.md](/home/masa/ws_aic/src/aic/docs/qualification_strategy_notes.md)
 と内容を重ねている。実験ログは生の時系列記録であり、strategy notes は設計と計画の文書である。このファイルは、その両者をつなぐ叙述的な橋渡しである。
 
+## このサマリの前提となるコンペルール
+
+このサマリでは、
+[qualification_phase.md](/home/masa/ws_aic/src/aic/docs/qualification_phase.md)、
+[challenge_rules.md](/home/masa/ws_aic/src/aic/docs/challenge_rules.md)、
+[scoring.md](/home/masa/ws_aic/src/aic/docs/scoring.md)
+のうち、今回の判断に直接効く点だけを抜き出して扱う。
+
+- 現行の qualification 評価は、ローカルでは `3` trial 構成で見ている
+- trial 1 と trial 2 は `SFP_MODULE -> SFP_PORT`、trial 3 は
+  `SC_PLUG -> SC_PORT`
+- 同じ policy が全 trial を処理しなければならない
+- task board pose、board 上の component pose、rail 上の搭載位置は
+  trial ごとに randomize される
+- ロボットは plug を把持した状態で開始し、target port は camera view 内に
+  ある
+- 提出可能な run では official interface だけを使う必要があり、
+  `/scoring/*`、`/gazebo/*`、`/gz_server/*` など backend や state leak への
+  依存は不可
+- 訓練や診断では ground truth や public-sample 固有情報を使えるが、それらは
+  submission-safe ではない
+
+## 用語メモ: `SFP` と `SC`
+
+この文書では、`SFP` と `SC` を次の意味で使う。
+
+- `SFP` は cable の `SFP_MODULE` 側を `NIC_CARD` の `SFP_PORT` に挿す task を
+  指す。要するに、trial 1 / 2 で扱うコネクタ系のこと
+- `SC` は cable の `SC_PLUG` 側を task board 上の `SC_PORT` に挿す task を
+  指す。要するに、trial 3 で扱うコネクタ系のこと
+- このサマリで `SFP path` や `SFP trial` と書いてあれば trial 1 / 2 側、
+  `SC path` や `SC trial` と書いてあれば trial 3 側の話だと思ってよい
+
+## スコアの付け方と読み方
+
+1 trial の total score は `Tier 1 + Tier 2 + Tier 3` で計算され、最大 `100`
+点である。
+
+- `Tier 1` は model validity で、`0` または `1`
+- `Tier 2` は motion quality で、smoothness `0-6`、duration `0-12`、
+  efficiency `0-6`、さらに insertion force `0 to -12` と off-limit
+  contact `0 to -24` の penalty が入る
+- `Tier 2` の正の加点は、full success か `Tier 3 > 0` のときにしか付かない
+- `Tier 3` は task success で、correct full insertion は `75`、wrong port
+  insertion は `-12`
+- full insertion がない場合、port 内に入っていれば partial insertion として
+  `38-50`、port 外なら proximity として `0-25`
+- したがって、port 入口まで来ても入っていない run は
+  `1 + 24 + 25 = 50` 前後で頭打ちになる
+- partial insertion 止まりでも理論上の上限は `1 + 24 + 50 = 75` なので、
+  `80+` / trial を出すには実質的に full insertion が必要になる
+- ここで扱う qualification run は通常 `3` trial なので、意味のある総スケール
+  は `300`
+
+## スコアから見た現在の失敗点
+
+代表 run の Tier 内訳で見ると、今つまずいている場所はかなり明確である。
+
+- `S2` の `trial_1=48.21` と `trial_2=48.98` は、どちらも
+  `Tier 1 = 1`、`Tier 2 ~= 23`、`Tier 3 ~= 24-25` でできている。
+  つまり `SFP` は「port 入口近傍までは安定して行けるが、挿入イベントは
+  起きていない」という状態である
+- `S2` の `trial_3=29.39` は `Tier 2 = 21.66` に対して
+  `Tier 3 = 6.73` しかなく、`SC` は smoothness や duration より前に、
+  まず target 近傍まで詰め切れていない
+- `P0` の `SFP-only` 2 trial は `35.22` / `36.10` で、`Tier 3` が
+  `12.02` と `10.95` に留まっている。つまり `center_uvz-only` は
+  `SFP` でさえ port 入口近傍の `25` に安定して届かず、本線の acquisition
+  として不足している
+- `T0 v0` と `T0 v1` は GT を使っても `Tier 3 ~= 23-25` に留まり、
+  insertion に入れない。さらに `trajectory smoothness` が `0-1` 点まで
+  崩れており、教師 route の問題は「知覚だけ」ではなく、controller 自体が
+  insertion-led でも smooth でもないことを示している
+- 代表 run の多くでは off-limit contact penalty も insertion force penalty
+  も決定的ではない。主な失点源は penalty ではなく、`Tier 3` が
+  proximity 帯から上がらないことである
+
+要するに、いま越えられていないのは「近づく」ことそのものではなく、
+`proximity (0-25)` から `partial insertion (38-50)`、さらに
+`full insertion (75)` へ移る scoring cliff である。
+
 ## 現時点の結論
 
 現在の状態は次のとおり。
@@ -70,8 +151,11 @@
 - スコアは合計 `100` ではなく、trial ごとに `100`
 - ここで扱う qualification sample run は通常 `3` trial なので、意味のある
   総スケールは `300`
+- pure proximity だけでは `50` 前後で頭打ちになり、partial insertion
+  止まりでも理論上の上限は `75`
 - したがって `120` 前後は「かなり良い」ではなく、本気の提出に必要な
-  trial あたり `80+` の水準にはまだ遠い
+  trial あたり `80+` の水準にはまだ遠いし、そのためには full insertion が
+  事実上必要になる
 
 この認識が、作業の重心を「小さな改善」から「挿入の崖を越える」方向へ移した。
 
