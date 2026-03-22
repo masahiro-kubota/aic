@@ -1006,13 +1006,6 @@ class QualPhasePilot(Policy):
         q_plug, plug_xyz = plug_tf
         q_gripper, gripper_xyz = gripper_tf
 
-        q_plug_inv = (-q_plug[0], q_plug[1], q_plug[2], q_plug[3])
-        q_diff = quaternion_multiply(q_port, q_plug_inv)
-        q_gripper_target = quaternion_multiply(q_diff, q_gripper)
-        q_gripper_slerp = quaternion_slerp(q_gripper, q_gripper_target, slerp_fraction)
-        if q_gripper_slerp is None:
-            return None
-
         tip_x_error = float(port_xyz[0] - plug_xyz[0])
         tip_y_error = float(port_xyz[1] - plug_xyz[1])
         integral_x = 0.0
@@ -1046,18 +1039,87 @@ class QualPhasePilot(Policy):
             integral_y = 0.0
 
         i_gain = 0.15
-        plug_tip_gripper_offset = (
-            gripper_xyz[0] - plug_xyz[0],
-            gripper_xyz[1] - plug_xyz[1],
-            gripper_xyz[2] - plug_xyz[2],
+        return self._gt_teacher_gripper_pose_from_port_relative(
+            task,
+            port_frame,
+            desired_plug_translation_port=np.array([0.0, 0.0, z_offset], dtype=float),
+            desired_plug_rotation_port=np.eye(3, dtype=float),
+            slerp_fraction=slerp_fraction,
+            position_fraction=position_fraction,
+            base_lateral_correction=np.array(
+                [i_gain * integral_x, i_gain * integral_y, 0.0], dtype=float
+            ),
         )
-        target_x = port_xyz[0] + i_gain * integral_x
-        target_y = port_xyz[1] + i_gain * integral_y
-        target_z = port_xyz[2] + z_offset - plug_tip_gripper_offset[2]
+
+    def _gt_teacher_gripper_pose_from_port_relative(
+        self,
+        task: Task,
+        port_frame: str,
+        desired_plug_translation_port: np.ndarray,
+        desired_plug_rotation_port: np.ndarray | None = None,
+        *,
+        slerp_fraction: float = 1.0,
+        position_fraction: float = 1.0,
+        base_lateral_correction: np.ndarray | None = None,
+    ) -> Pose | None:
+        port_tf = self._lookup_frame_transform_base(port_frame)
+        plug_tf = self._lookup_frame_transform_base(
+            f"{task.cable_name}/{task.plug_name}_link"
+        )
+        gripper_tf = self._lookup_frame_transform_base("gripper/tcp")
+        if port_tf is None or plug_tf is None or gripper_tf is None:
+            return None
+
+        q_port, port_xyz = port_tf
+        q_plug, plug_xyz = plug_tf
+        q_gripper, gripper_xyz = gripper_tf
+
+        rotation_port = quat2mat(q_port)
+        rotation_plug = quat2mat(q_plug)
+        rotation_gripper = quat2mat(q_gripper)
+
+        transform_base_plug = np.eye(4, dtype=float)
+        transform_base_plug[:3, :3] = rotation_plug
+        transform_base_plug[:3, 3] = np.array(plug_xyz, dtype=float)
+
+        transform_base_gripper = np.eye(4, dtype=float)
+        transform_base_gripper[:3, :3] = rotation_gripper
+        transform_base_gripper[:3, 3] = np.array(gripper_xyz, dtype=float)
+
+        transform_plug_gripper = np.linalg.inv(transform_base_plug) @ transform_base_gripper
+
+        if desired_plug_rotation_port is None:
+            desired_plug_rotation_port = np.eye(3, dtype=float)
+        desired_plug_translation_port = np.array(
+            desired_plug_translation_port, dtype=float
+        )
+        desired_plug_rotation_port = np.array(
+            desired_plug_rotation_port, dtype=float
+        )
+        lateral_correction = np.zeros(3, dtype=float)
+        if base_lateral_correction is not None:
+            lateral_correction = np.array(base_lateral_correction, dtype=float)
+
+        transform_base_plug_target = np.eye(4, dtype=float)
+        transform_base_plug_target[:3, :3] = rotation_port @ desired_plug_rotation_port
+        transform_base_plug_target[:3, 3] = (
+            np.array(port_xyz, dtype=float)
+            + (rotation_port @ desired_plug_translation_port)
+            + lateral_correction
+        )
+
+        transform_base_gripper_target = (
+            transform_base_plug_target @ transform_plug_gripper
+        )
+        q_gripper_target = mat2quat(transform_base_gripper_target[:3, :3])
+        q_gripper_slerp = quaternion_slerp(q_gripper, q_gripper_target, slerp_fraction)
+        if q_gripper_slerp is None:
+            return None
+
+        gripper_target_xyz = transform_base_gripper_target[:3, 3]
         blend_xyz = (
-            position_fraction * target_x + (1.0 - position_fraction) * gripper_xyz[0],
-            position_fraction * target_y + (1.0 - position_fraction) * gripper_xyz[1],
-            position_fraction * target_z + (1.0 - position_fraction) * gripper_xyz[2],
+            position_fraction * gripper_target_xyz
+            + (1.0 - position_fraction) * np.array(gripper_xyz, dtype=float)
         )
         return Pose(
             position=Point(
@@ -1072,6 +1134,27 @@ class QualPhasePilot(Policy):
                 z=float(q_gripper_slerp[3]),
             ),
         )
+
+    def _gt_plug_pose_in_port_frame(
+        self, task: Task, port_frame: str
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        port_tf = self._lookup_frame_transform_base(port_frame)
+        plug_tf = self._lookup_frame_transform_base(
+            f"{task.cable_name}/{task.plug_name}_link"
+        )
+        if port_tf is None or plug_tf is None:
+            return None
+
+        q_port, port_xyz = port_tf
+        q_plug, plug_xyz = plug_tf
+        rotation_port = quat2mat(q_port)
+        rotation_plug = quat2mat(q_plug)
+        rotation_port_inv = rotation_port.T
+        plug_translation_port = rotation_port_inv @ (
+            np.array(plug_xyz, dtype=float) - np.array(port_xyz, dtype=float)
+        )
+        plug_rotation_port = rotation_port_inv @ rotation_plug
+        return plug_translation_port, plug_rotation_port
 
     def _camera_view(
         self, observation: Observation | None, camera_name: str
@@ -4396,6 +4479,333 @@ class QualPhasePilot(Policy):
             "phase_records": phase_records,
         }
 
+    def _run_pose_closure_to_target(
+        self,
+        initial_pose: Pose,
+        initial_observation: Observation,
+        target_pose: Pose,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        phase_prefix: str,
+        *,
+        max_steps: int = 8,
+        move_duration_sec: float = 0.20,
+        hold_duration_sec: float = 0.10,
+        translation_success_tol_m: float = 0.015,
+        rotation_success_tol_rad: float = 0.08,
+        min_progress_m: float = 0.002,
+        max_stalled_steps: int = 2,
+    ) -> tuple[Pose, Observation | None, dict[str, object]]:
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(initial_observation, initial_pose)
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        step_records: list[dict[str, object]] = []
+        stalled_steps = 0
+
+        for step_index in range(max_steps):
+            remaining_translation_delta, remaining_rotation_delta = self._pose_delta_base(
+                current_pose,
+                target_pose,
+            )
+            remaining_translation_norm_m = float(np.linalg.norm(remaining_translation_delta))
+            remaining_rotation_norm_rad = float(np.linalg.norm(remaining_rotation_delta))
+            if (
+                remaining_translation_norm_m < translation_success_tol_m
+                and remaining_rotation_norm_rad < rotation_success_tol_rad
+            ):
+                break
+
+            applied_translation_delta, applied_rotation_delta = (
+                self._clamp_sfp_teacher_step_delta(
+                    remaining_translation_delta,
+                    remaining_rotation_delta,
+                )
+            )
+            next_pose = self._apply_pose_residual_base(
+                current_pose,
+                translation_delta_base=applied_translation_delta,
+                rotation_delta_rotvec_base=applied_rotation_delta,
+            )
+            debug_run.log_command_sample(
+                f"{phase_prefix}_closure_step",
+                next_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"step={step_index + 1}/{max_steps} "
+                    f"remaining_t={remaining_translation_norm_m:.4f} "
+                    f"remaining_r={remaining_rotation_norm_rad:.4f}"
+                ),
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                next_pose,
+                duration_sec=move_duration_sec,
+                debug_run=debug_run,
+                phase_name=f"{phase_prefix}_closure_move_{step_index + 1}",
+            )
+            self._hold_pose(
+                move_robot,
+                next_pose,
+                duration_sec=hold_duration_sec,
+                debug_run=debug_run,
+                phase_name=f"{phase_prefix}_closure_settle_{step_index + 1}",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                current_pose = self._observed_tcp_pose(next_observation, next_pose)
+            else:
+                current_pose = next_pose
+
+            next_remaining_translation_delta, next_remaining_rotation_delta = (
+                self._pose_delta_base(current_pose, target_pose)
+            )
+            next_remaining_translation_norm_m = float(
+                np.linalg.norm(next_remaining_translation_delta)
+            )
+            next_remaining_rotation_norm_rad = float(
+                np.linalg.norm(next_remaining_rotation_delta)
+            )
+            progress_m = remaining_translation_norm_m - next_remaining_translation_norm_m
+            if progress_m < min_progress_m:
+                stalled_steps += 1
+            else:
+                stalled_steps = 0
+
+            step_records.append(
+                {
+                    "step_index": int(step_index + 1),
+                    "remaining_translation_norm_m": remaining_translation_norm_m,
+                    "remaining_rotation_norm_rad": remaining_rotation_norm_rad,
+                    "next_remaining_translation_norm_m": next_remaining_translation_norm_m,
+                    "next_remaining_rotation_norm_rad": next_remaining_rotation_norm_rad,
+                    "progress_m": progress_m,
+                    "stalled_steps": stalled_steps,
+                    "applied_translation_delta_base": [
+                        float(value) for value in applied_translation_delta
+                    ],
+                    "applied_rotation_delta_rotvec_base": [
+                        float(value) for value in applied_rotation_delta
+                    ],
+                    "pose": _pose_to_dict(current_pose),
+                }
+            )
+            if stalled_steps >= max_stalled_steps:
+                break
+
+        final_remaining_translation_delta, final_remaining_rotation_delta = self._pose_delta_base(
+            current_pose,
+            target_pose,
+        )
+        return current_pose, current_observation, {
+            "target_pose": _pose_to_dict(target_pose),
+            "final_remaining_translation_norm_m": float(
+                np.linalg.norm(final_remaining_translation_delta)
+            ),
+            "final_remaining_rotation_norm_rad": float(
+                np.linalg.norm(final_remaining_rotation_delta)
+            ),
+            "step_records": step_records,
+        }
+
+    def _run_sfp_gt_teacher_insert_adaptive(
+        self,
+        task: Task,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        teacher_schedule: tuple[tuple[str, float, float, float], ...] | None = None,
+    ) -> tuple[Pose | None, Observation | None, dict[str, object]]:
+        port_frame = self._port_frame_name(task)
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(
+            initial_observation,
+            initial_observation.controller_state.reference_tcp_pose,
+        )
+        phase_records: list[dict[str, object]] = []
+        if teacher_schedule is None:
+            teacher_schedule = (
+                ("teacher_hover", 0.16, 0.24, 0.12),
+                ("teacher_preinsert_far", 0.10, 0.22, 0.12),
+                ("teacher_preinsert_mid", 0.06, 0.22, 0.12),
+                ("teacher_preinsert_near", 0.04, 0.20, 0.12),
+                ("teacher_insert_1", 0.025, 0.18, 0.12),
+                ("teacher_insert_2", 0.015, 0.18, 0.12),
+            )
+
+        for phase_name, z_offset, move_sec, hold_sec in teacher_schedule:
+            target_pose = self._gt_teacher_gripper_pose(
+                task,
+                port_frame,
+                slerp_fraction=1.0,
+                position_fraction=1.0,
+                z_offset=z_offset,
+                reset_xy_integrator=(phase_name == "teacher_hover"),
+                update_integrator=False,
+            )
+            if target_pose is None:
+                return None, current_observation, {
+                    "port_frame": port_frame,
+                    "phase_records": phase_records,
+                    "failed_phase": phase_name,
+                    "message": "gt teacher pose unavailable",
+                }
+
+            phase_pose, phase_observation, phase_metadata = self._run_pose_closure_to_target(
+                current_pose,
+                current_observation
+                if current_observation is not None
+                else initial_observation,
+                target_pose,
+                get_observation,
+                move_robot,
+                debug_run,
+                phase_name,
+                max_steps=10 if z_offset <= 0.04 else 8,
+                move_duration_sec=move_sec,
+                hold_duration_sec=hold_sec,
+                translation_success_tol_m=0.020 if z_offset > 0.04 else 0.015,
+                rotation_success_tol_rad=0.10 if z_offset > 0.04 else 0.08,
+                min_progress_m=0.0015,
+                max_stalled_steps=3,
+            )
+            current_pose = phase_pose
+            current_observation = phase_observation
+            phase_records.append(
+                {
+                    "phase_name": phase_name,
+                    "z_offset": float(z_offset),
+                    "target_pose": _pose_to_dict(target_pose),
+                    "phase_metadata": phase_metadata,
+                }
+            )
+
+        return current_pose, current_observation, {
+            "port_frame": port_frame,
+            "phase_records": phase_records,
+        }
+
+    def _run_sfp_gt_teacher_insert_until_contact(
+        self,
+        task: Task,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        *,
+        teacher_schedule: tuple[tuple[str, float, float, float], ...] | None = None,
+        stop_excess_force_norm: float = 6.0,
+        stop_tracking_error_m: float = 0.006,
+    ) -> tuple[Pose | None, Observation | None, dict[str, object]]:
+        port_frame = self._port_frame_name(task)
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(
+            initial_observation,
+            initial_observation.controller_state.reference_tcp_pose,
+        )
+        baseline_force_norm = self._force_norm(initial_observation)
+        phase_records: list[dict[str, object]] = []
+        stop_reason = "schedule_complete"
+        if teacher_schedule is None:
+            teacher_schedule = (
+                ("teacher_hover", 0.16, 0.24, 0.12),
+                ("teacher_preinsert_far", 0.10, 0.22, 0.12),
+                ("teacher_preinsert_mid", 0.06, 0.22, 0.12),
+                ("teacher_preinsert_near", 0.04, 0.20, 0.12),
+                ("teacher_insert_1", 0.025, 0.18, 0.12),
+                ("teacher_insert_2", 0.015, 0.18, 0.12),
+            )
+
+        for phase_name, z_offset, move_sec, hold_sec in teacher_schedule:
+            target_pose = self._gt_teacher_gripper_pose(
+                task,
+                port_frame,
+                slerp_fraction=1.0,
+                position_fraction=1.0,
+                z_offset=z_offset,
+                reset_xy_integrator=(phase_name == "teacher_hover"),
+                update_integrator=False,
+            )
+            if target_pose is None:
+                return None, current_observation, {
+                    "port_frame": port_frame,
+                    "phase_records": phase_records,
+                    "failed_phase": phase_name,
+                    "message": "gt teacher pose unavailable",
+                }
+
+            phase_pose, phase_observation, phase_metadata = self._run_pose_closure_to_target(
+                current_pose,
+                current_observation
+                if current_observation is not None
+                else initial_observation,
+                target_pose,
+                get_observation,
+                move_robot,
+                debug_run,
+                phase_name,
+                max_steps=10 if z_offset <= 0.04 else 8,
+                move_duration_sec=move_sec,
+                hold_duration_sec=hold_sec,
+                translation_success_tol_m=0.020 if z_offset > 0.04 else 0.015,
+                rotation_success_tol_rad=0.10 if z_offset > 0.04 else 0.08,
+                min_progress_m=0.0015,
+                max_stalled_steps=3,
+            )
+            current_pose = phase_pose
+            current_observation = phase_observation
+            tracking_error_m = None
+            force_norm = None
+            excess_force_norm = None
+            if current_observation is not None:
+                tracking_error_m = float(
+                    np.linalg.norm(current_observation.controller_state.tcp_error[:3])
+                )
+                force_norm = self._force_norm(current_observation)
+                excess_force_norm = force_norm - baseline_force_norm
+
+            phase_records.append(
+                {
+                    "phase_name": phase_name,
+                    "z_offset": float(z_offset),
+                    "target_pose": _pose_to_dict(target_pose),
+                    "phase_metadata": phase_metadata,
+                    "tracking_error_m": tracking_error_m,
+                    "force_norm": force_norm,
+                    "excess_force_norm": excess_force_norm,
+                }
+            )
+
+            if (
+                excess_force_norm is not None
+                and excess_force_norm >= stop_excess_force_norm
+            ):
+                stop_reason = f"force_gate@{phase_name}"
+                break
+            if (
+                tracking_error_m is not None
+                and tracking_error_m >= stop_tracking_error_m
+            ):
+                stop_reason = f"tracking_gate@{phase_name}"
+                break
+
+        return current_pose, current_observation, {
+            "port_frame": port_frame,
+            "phase_records": phase_records,
+            "stop_reason": stop_reason,
+            "baseline_force_norm": baseline_force_norm,
+            "stop_excess_force_norm": stop_excess_force_norm,
+            "stop_tracking_error_m": stop_tracking_error_m,
+        }
+
     def _run_sfp_gt_teacher_terminal_insert(
         self,
         task: Task,
@@ -4473,6 +4883,1117 @@ class QualPhasePilot(Policy):
             )
 
         return current_pose, current_observation, {"phase_records": phase_records}
+
+    def _run_sfp_gt_progress_gated_insert(
+        self,
+        task: Task,
+        initial_pose: Pose,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        baseline_force_norm: float | None = None,
+        start_z_offset: float = 0.015,
+        goal_z_offsets: tuple[float, ...] = (0.010, 0.006, 0.003, 0.001, 0.0, -0.0015),
+    ) -> tuple[Pose, Observation | None, dict[str, object]]:
+        current_pose = self._observed_tcp_pose(initial_observation, initial_pose)
+        current_observation: Observation | None = initial_observation
+        safe_pose = current_pose
+        safe_observation: Observation | None = current_observation
+        safe_z_offset = float(start_z_offset)
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        if baseline_force_norm is None:
+            baseline_force_norm = self._force_norm(initial_observation)
+
+        progress_records: list[dict[str, object]] = []
+        port_frame = self._port_frame_name(task)
+
+        for goal_index, goal_z_offset in enumerate(goal_z_offsets, start=1):
+            candidate_z_offset = float(goal_z_offset)
+            candidate_attempts = 0
+            while True:
+                target_pose = self._gt_teacher_gripper_pose(
+                    task,
+                    port_frame,
+                    slerp_fraction=1.0,
+                    position_fraction=1.0,
+                    z_offset=candidate_z_offset,
+                    update_integrator=False,
+                )
+                if target_pose is None:
+                    return safe_pose, safe_observation, {
+                        "failed_goal_z_offset": goal_z_offset,
+                        "safe_z_offset": safe_z_offset,
+                        "progress_records": progress_records,
+                        "message": "gt teacher pose unavailable during progress-gated insert",
+                    }
+
+                insertion_axis = self._tool_axis_in_base(
+                    target_pose, self._SFP_TOOL_INSERTION_AXIS
+                )
+                insertion_axis /= max(np.linalg.norm(insertion_axis), 1e-6)
+                safe_position = self._pose_position(safe_pose)
+                target_position = self._pose_position(target_pose)
+                requested_advance_m = float(
+                    max(
+                        np.dot(target_position - safe_position, insertion_axis),
+                        0.0,
+                    )
+                )
+                move_duration_sec = float(np.clip(0.12 + 12.0 * requested_advance_m, 0.12, 0.24))
+                hold_duration_sec = float(np.clip(0.08 + 8.0 * requested_advance_m, 0.08, 0.16))
+
+                debug_run.log_phase(
+                    "teacher_progress_insert_start",
+                    self.time_now().nanoseconds / 1e9,
+                    note=(
+                        f"goal_index={goal_index} safe_z={safe_z_offset:.4f} "
+                        f"candidate_z={candidate_z_offset:.4f} request={requested_advance_m:.4f}"
+                    ),
+                )
+                self._move_for_duration(
+                    move_robot,
+                    safe_pose,
+                    target_pose,
+                    duration_sec=move_duration_sec,
+                    debug_run=debug_run,
+                    phase_name="teacher_progress_insert_move",
+                )
+                self._hold_pose(
+                    move_robot,
+                    target_pose,
+                    duration_sec=hold_duration_sec,
+                    debug_run=debug_run,
+                    phase_name="teacher_progress_insert_settle",
+                )
+                next_observation = self._wait_for_observation(
+                    get_observation,
+                    timeout_sec=0.7,
+                    newer_than_sec=last_stamp_sec,
+                )
+                if next_observation is not None:
+                    current_observation = next_observation
+                    last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                observed_pose = self._observed_tcp_pose(current_observation, target_pose)
+                observed_position = self._pose_position(observed_pose)
+                actual_advance_m = float(
+                    np.dot(observed_position - safe_position, insertion_axis)
+                )
+                tracking_error_m = None
+                measured_force_norm = None
+                excess_force_norm = None
+                if current_observation is not None:
+                    tracking_error_m = float(
+                        np.linalg.norm(current_observation.controller_state.tcp_error[:3])
+                    )
+                    measured_force_norm = self._force_norm(current_observation)
+                    excess_force_norm = measured_force_norm - baseline_force_norm
+
+                min_required_advance_m = max(
+                    0.0010,
+                    min(requested_advance_m * 0.45, requested_advance_m + 1e-6),
+                )
+                advanced_enough = actual_advance_m >= min_required_advance_m
+                overloaded = excess_force_norm is not None and excess_force_norm > 8.0
+                diverged = tracking_error_m is not None and tracking_error_m > 0.024
+                success = advanced_enough and not overloaded and not diverged
+
+                record: dict[str, object] = {
+                    "goal_index": goal_index,
+                    "goal_z_offset": float(goal_z_offset),
+                    "candidate_z_offset": float(candidate_z_offset),
+                    "safe_z_offset_before": float(safe_z_offset),
+                    "requested_advance_m": requested_advance_m,
+                    "actual_advance_m": actual_advance_m,
+                    "tracking_error_m": tracking_error_m,
+                    "force_norm": measured_force_norm,
+                    "excess_force_norm": excess_force_norm,
+                    "success": success,
+                    "pose": _pose_to_dict(observed_pose),
+                }
+                progress_records.append(record)
+                debug_run.log_command_sample(
+                    "teacher_progress_insert",
+                    target_pose,
+                    self.time_now().nanoseconds / 1e9,
+                    note=(
+                        f"goal_index={goal_index} goal_z={goal_z_offset:.4f} "
+                        f"candidate_z={candidate_z_offset:.4f} request={requested_advance_m:.4f} "
+                        f"actual={actual_advance_m:.4f} "
+                        f"track={tracking_error_m if tracking_error_m is not None else float('nan'):.4f} "
+                        f"force={measured_force_norm if measured_force_norm is not None else float('nan'):.2f} "
+                        f"excess={excess_force_norm if excess_force_norm is not None else float('nan'):.2f} "
+                        f"success={success}"
+                    ),
+                )
+
+                if success:
+                    safe_pose = self._make_pose(
+                        observed_position,
+                        self._quat_xyzw_to_wxyz(target_pose.orientation),
+                    )
+                    safe_observation = current_observation
+                    safe_z_offset = float(candidate_z_offset)
+                    current_pose = safe_pose
+                    break
+
+                debug_run.log_phase(
+                    "teacher_progress_insert_abort",
+                    self.time_now().nanoseconds / 1e9,
+                    note=(
+                        f"goal_index={goal_index} goal_z={goal_z_offset:.4f} "
+                        f"candidate_z={candidate_z_offset:.4f} actual={actual_advance_m:.4f} "
+                        f"track={tracking_error_m if tracking_error_m is not None else float('nan'):.4f} "
+                        f"excess={excess_force_norm if excess_force_norm is not None else float('nan'):.2f}"
+                    ),
+                )
+
+                retreat_pose = self._run_tool_axis_push(
+                    move_robot,
+                    observed_pose,
+                    self._SFP_TOOL_INSERTION_AXIS,
+                    push_distance_m=-0.0018,
+                    duration_sec=0.10,
+                    hold_sec=0.06,
+                    debug_run=debug_run,
+                    phase_prefix=f"teacher_progress_goal_{goal_index}_retreat",
+                )
+                retreat_observation = self._wait_for_observation(
+                    get_observation,
+                    timeout_sec=0.5,
+                    newer_than_sec=last_stamp_sec,
+                )
+                if retreat_observation is not None:
+                    current_observation = retreat_observation
+                    last_stamp_sec = _stamp_to_float(
+                        retreat_observation.center_image.header.stamp
+                    )
+                    current_pose = self._observed_tcp_pose(retreat_observation, retreat_pose)
+                else:
+                    current_pose = retreat_pose
+
+                safe_target_pose = self._gt_teacher_gripper_pose(
+                    task,
+                    port_frame,
+                    slerp_fraction=1.0,
+                    position_fraction=1.0,
+                    z_offset=safe_z_offset,
+                    update_integrator=False,
+                )
+                if safe_target_pose is not None:
+                    self._move_for_duration(
+                        move_robot,
+                        current_pose,
+                        safe_target_pose,
+                        duration_sec=0.14,
+                        debug_run=debug_run,
+                        phase_name="teacher_progress_recenter",
+                    )
+                    self._hold_pose(
+                        move_robot,
+                        safe_target_pose,
+                        duration_sec=0.08,
+                        debug_run=debug_run,
+                        phase_name="teacher_progress_recenter_settle",
+                    )
+                    recenter_observation = self._wait_for_observation(
+                        get_observation,
+                        timeout_sec=0.6,
+                        newer_than_sec=last_stamp_sec,
+                    )
+                    if recenter_observation is not None:
+                        current_observation = recenter_observation
+                        last_stamp_sec = _stamp_to_float(
+                            recenter_observation.center_image.header.stamp
+                        )
+                        current_pose = self._observed_tcp_pose(
+                            recenter_observation, safe_target_pose
+                        )
+                    else:
+                        current_pose = safe_target_pose
+
+                z_gap_m = abs(candidate_z_offset - safe_z_offset)
+                if z_gap_m <= 0.0015 or candidate_attempts >= 2:
+                    return safe_pose, safe_observation, {
+                        "safe_z_offset": safe_z_offset,
+                        "failed_goal_z_offset": goal_z_offset,
+                        "failed_candidate_z_offset": candidate_z_offset,
+                        "progress_records": progress_records,
+                    }
+
+                candidate_z_offset = 0.5 * (candidate_z_offset + safe_z_offset)
+                candidate_attempts += 1
+
+        return safe_pose, safe_observation, {
+            "safe_z_offset": safe_z_offset,
+            "progress_records": progress_records,
+        }
+
+    def _run_sfp_gt_xy_alignment(
+        self,
+        task: Task,
+        initial_pose: Pose,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        *,
+        phase_prefix: str = "teacher_xy_align",
+        max_iterations: int = 6,
+        xy_success_tol_m: float = 0.0045,
+    ) -> tuple[Pose, Observation | None, dict[str, object]]:
+        current_pose = self._observed_tcp_pose(initial_observation, initial_pose)
+        current_observation: Observation | None = initial_observation
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        port_frame = self._port_frame_name(task)
+        iteration_records: list[dict[str, object]] = []
+
+        for iteration_index in range(1, max_iterations + 1):
+            plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            if plug_pose_port is None:
+                return current_pose, current_observation, {
+                    "message": "gt plug pose unavailable during xy alignment",
+                    "iteration_records": iteration_records,
+                }
+            plug_translation_port, plug_rotation_port = plug_pose_port
+            xy_error_m = float(np.linalg.norm(plug_translation_port[:2]))
+            if xy_error_m <= xy_success_tol_m:
+                break
+
+            desired_plug_translation_port = np.array(
+                [0.0, 0.0, float(plug_translation_port[2])], dtype=float
+            )
+            target_pose = self._gt_teacher_gripper_pose_from_port_relative(
+                task,
+                port_frame,
+                desired_plug_translation_port=desired_plug_translation_port,
+                desired_plug_rotation_port=plug_rotation_port,
+                slerp_fraction=1.0,
+                position_fraction=1.0,
+            )
+            if target_pose is None:
+                return current_pose, current_observation, {
+                    "message": "xy alignment target pose unavailable",
+                    "iteration_records": iteration_records,
+                }
+
+            aligned_pose, aligned_observation, phase_metadata = self._run_pose_closure_to_target(
+                current_pose,
+                current_observation
+                if current_observation is not None
+                else initial_observation,
+                target_pose,
+                get_observation,
+                move_robot,
+                debug_run,
+                f"{phase_prefix}_{iteration_index}",
+                max_steps=3,
+                move_duration_sec=0.14,
+                hold_duration_sec=0.08,
+                translation_success_tol_m=0.006,
+                rotation_success_tol_rad=0.08,
+                min_progress_m=0.001,
+                max_stalled_steps=2,
+            )
+            current_pose = aligned_pose
+            current_observation = aligned_observation
+            if current_observation is not None:
+                last_stamp_sec = _stamp_to_float(current_observation.center_image.header.stamp)
+
+            updated_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            iteration_records.append(
+                {
+                    "iteration_index": int(iteration_index),
+                    "plug_translation_port_before": [
+                        float(value) for value in plug_translation_port
+                    ],
+                    "target_pose": _pose_to_dict(target_pose),
+                    "phase_metadata": phase_metadata,
+                    "plug_translation_port_after": (
+                        [float(value) for value in updated_plug_pose_port[0]]
+                        if updated_plug_pose_port is not None
+                        else None
+                    ),
+                }
+            )
+
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.5,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                current_pose = self._observed_tcp_pose(next_observation, current_pose)
+
+        final_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+        return current_pose, current_observation, {
+            "iteration_records": iteration_records,
+            "final_plug_translation_port": (
+                [float(value) for value in final_plug_pose_port[0]]
+                if final_plug_pose_port is not None
+                else None
+            ),
+        }
+
+    def _run_sfp_gt_xy_alignment_bounded(
+        self,
+        task: Task,
+        initial_pose: Pose,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        *,
+        phase_prefix: str = "teacher_xy_align_bounded",
+        max_iterations: int = 8,
+        xy_success_tol_m: float = 0.0045,
+        max_axis_step_m: float = 0.003,
+        move_duration_sec: float = 0.16,
+        hold_duration_sec: float = 0.10,
+        max_tracking_error_m: float = 0.018,
+        max_excess_force_norm: float = 7.0,
+    ) -> tuple[Pose, Observation | None, dict[str, object]]:
+        current_pose = self._observed_tcp_pose(initial_observation, initial_pose)
+        current_observation: Observation | None = initial_observation
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        baseline_force_norm = self._force_norm(initial_observation)
+        port_frame = self._port_frame_name(task)
+        iteration_records: list[dict[str, object]] = []
+
+        for iteration_index in range(1, max_iterations + 1):
+            plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            if plug_pose_port is None:
+                return current_pose, current_observation, {
+                    "message": "gt plug pose unavailable during bounded xy alignment",
+                    "iteration_records": iteration_records,
+                }
+            plug_translation_port, plug_rotation_port = plug_pose_port
+            xy_error_m = float(np.linalg.norm(plug_translation_port[:2]))
+            if xy_error_m <= xy_success_tol_m:
+                break
+
+            clipped_xy_delta = np.clip(
+                -plug_translation_port[:2],
+                -max_axis_step_m,
+                max_axis_step_m,
+            )
+            desired_plug_translation_port = np.array(
+                [
+                    float(plug_translation_port[0] + clipped_xy_delta[0]),
+                    float(plug_translation_port[1] + clipped_xy_delta[1]),
+                    float(plug_translation_port[2]),
+                ],
+                dtype=float,
+            )
+            target_pose = self._gt_teacher_gripper_pose_from_port_relative(
+                task,
+                port_frame,
+                desired_plug_translation_port=desired_plug_translation_port,
+                desired_plug_rotation_port=plug_rotation_port,
+                slerp_fraction=1.0,
+                position_fraction=1.0,
+            )
+            if target_pose is None:
+                return current_pose, current_observation, {
+                    "message": "bounded xy target pose unavailable",
+                    "iteration_records": iteration_records,
+                }
+
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=move_duration_sec,
+                debug_run=debug_run,
+                phase_name=f"{phase_prefix}_move_{iteration_index}",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=hold_duration_sec,
+                debug_run=debug_run,
+                phase_name=f"{phase_prefix}_settle_{iteration_index}",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                current_pose = self._observed_tcp_pose(next_observation, target_pose)
+            else:
+                current_pose = target_pose
+
+            updated_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            if updated_plug_pose_port is None:
+                return current_pose, current_observation, {
+                    "message": "gt plug pose lost after bounded xy alignment",
+                    "iteration_records": iteration_records,
+                }
+            updated_translation_port, _updated_rotation_port = updated_plug_pose_port
+            updated_xy_error_m = float(np.linalg.norm(updated_translation_port[:2]))
+            xy_progress_m = float(xy_error_m - updated_xy_error_m)
+            tracking_error_m = None
+            excess_force_norm = None
+            if current_observation is not None:
+                tracking_error_m = float(
+                    np.linalg.norm(current_observation.controller_state.tcp_error[:3])
+                )
+                excess_force_norm = self._force_norm(current_observation) - baseline_force_norm
+
+            iteration_records.append(
+                {
+                    "iteration_index": int(iteration_index),
+                    "plug_translation_port_before": [
+                        float(value) for value in plug_translation_port
+                    ],
+                    "desired_plug_translation_port": [
+                        float(value) for value in desired_plug_translation_port
+                    ],
+                    "plug_translation_port_after": [
+                        float(value) for value in updated_translation_port
+                    ],
+                    "xy_error_before_m": xy_error_m,
+                    "xy_error_after_m": updated_xy_error_m,
+                    "xy_progress_m": xy_progress_m,
+                    "tracking_error_m": tracking_error_m,
+                    "excess_force_norm": excess_force_norm,
+                    "target_pose": _pose_to_dict(target_pose),
+                }
+            )
+            debug_run.log_phase(
+                f"{phase_prefix}_step",
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"iter={iteration_index} xy_before={xy_error_m:.4f} "
+                    f"xy_after={updated_xy_error_m:.4f} progress={xy_progress_m:.4f} "
+                    f"track={tracking_error_m if tracking_error_m is not None else float('nan'):.4f} "
+                    f"excess={excess_force_norm if excess_force_norm is not None else float('nan'):.2f}"
+                ),
+            )
+
+            if tracking_error_m is not None and tracking_error_m > max_tracking_error_m:
+                break
+            if excess_force_norm is not None and excess_force_norm > max_excess_force_norm:
+                break
+            if xy_progress_m < 0.0007:
+                break
+
+        final_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+        return current_pose, current_observation, {
+            "iteration_records": iteration_records,
+            "final_plug_translation_port": (
+                [float(value) for value in final_plug_pose_port[0]]
+                if final_plug_pose_port is not None
+                else None
+            ),
+        }
+
+    def _run_sfp_gt_incremental_insert(
+        self,
+        task: Task,
+        initial_pose: Pose,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        *,
+        max_steps: int = 18,
+        max_step_m: float = 0.004,
+        xy_guard_tol_m: float = 0.0045,
+    ) -> tuple[Pose, Observation | None, dict[str, object]]:
+        current_pose = self._observed_tcp_pose(initial_observation, initial_pose)
+        current_observation: Observation | None = initial_observation
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        baseline_force_norm = self._force_norm(initial_observation)
+        port_frame = self._port_frame_name(task)
+        step_records: list[dict[str, object]] = []
+
+        for step_index in range(1, max_steps + 1):
+            plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            if plug_pose_port is None:
+                return current_pose, current_observation, {
+                    "message": "gt plug pose unavailable during incremental insert",
+                    "step_records": step_records,
+                }
+            plug_translation_port, _plug_rotation_port = plug_pose_port
+            xy_error_m = float(np.linalg.norm(plug_translation_port[:2]))
+            z_before_m = float(plug_translation_port[2])
+            if xy_error_m > xy_guard_tol_m:
+                return current_pose, current_observation, {
+                    "message": "xy error exceeded guard during incremental insert",
+                    "step_records": step_records,
+                    "final_plug_translation_port": [
+                        float(value) for value in plug_translation_port
+                    ],
+                }
+            if z_before_m >= -0.008:
+                break
+
+            requested_z_progress_m = min(max_step_m, abs(z_before_m))
+            desired_translation_port = np.array(
+                [0.0, 0.0, z_before_m + requested_z_progress_m], dtype=float
+            )
+            target_pose = self._gt_teacher_gripper_pose_from_port_relative(
+                task,
+                port_frame,
+                desired_plug_translation_port=desired_translation_port,
+                desired_plug_rotation_port=np.eye(3, dtype=float),
+                slerp_fraction=1.0,
+                position_fraction=1.0,
+            )
+            if target_pose is None:
+                return current_pose, current_observation, {
+                    "message": "incremental insert target unavailable",
+                    "step_records": step_records,
+                }
+
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.12,
+                debug_run=debug_run,
+                phase_name="teacher_incremental_insert_move",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=0.08,
+                debug_run=debug_run,
+                phase_name="teacher_incremental_insert_settle",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.6,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                current_pose = self._observed_tcp_pose(next_observation, target_pose)
+            else:
+                current_pose = target_pose
+
+            updated_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            if updated_plug_pose_port is None:
+                return current_pose, current_observation, {
+                    "message": "gt plug pose lost after incremental insert step",
+                    "step_records": step_records,
+                }
+            updated_translation_port, _updated_rotation_port = updated_plug_pose_port
+            z_after_m = float(updated_translation_port[2])
+            actual_z_progress_m = float(z_after_m - z_before_m)
+            tracking_error_m = None
+            excess_force_norm = None
+            if current_observation is not None:
+                tracking_error_m = float(
+                    np.linalg.norm(current_observation.controller_state.tcp_error[:3])
+                )
+                excess_force_norm = self._force_norm(current_observation) - baseline_force_norm
+
+            step_records.append(
+                {
+                    "step_index": int(step_index),
+                    "plug_translation_port_before": [
+                        float(value) for value in plug_translation_port
+                    ],
+                    "plug_translation_port_after": [
+                        float(value) for value in updated_translation_port
+                    ],
+                    "requested_z_progress_m": requested_z_progress_m,
+                    "actual_z_progress_m": actual_z_progress_m,
+                    "tracking_error_m": tracking_error_m,
+                    "excess_force_norm": excess_force_norm,
+                    "target_pose": _pose_to_dict(target_pose),
+                }
+            )
+            debug_run.log_phase(
+                "teacher_incremental_insert_step",
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"step={step_index} z_before={z_before_m:.4f} "
+                    f"z_after={z_after_m:.4f} requested={requested_z_progress_m:.4f} "
+                    f"actual={actual_z_progress_m:.4f} "
+                    f"track={tracking_error_m if tracking_error_m is not None else float('nan'):.4f}"
+                ),
+            )
+
+            if tracking_error_m is not None and tracking_error_m > 0.022:
+                break
+            if excess_force_norm is not None and excess_force_norm > 8.0:
+                break
+            if actual_z_progress_m < max(0.0006, 0.30 * requested_z_progress_m):
+                break
+
+            if abs(updated_translation_port[0]) > xy_guard_tol_m or abs(
+                updated_translation_port[1]
+            ) > xy_guard_tol_m:
+                realigned_pose, realigned_observation, _realign_metadata = (
+                    self._run_sfp_gt_xy_alignment(
+                        task,
+                        current_pose,
+                        current_observation
+                        if current_observation is not None
+                        else initial_observation,
+                        get_observation,
+                        move_robot,
+                        debug_run,
+                        phase_prefix=f"teacher_incremental_xy_realign_{step_index}",
+                        max_iterations=2,
+                        xy_success_tol_m=xy_guard_tol_m,
+                    )
+                )
+                current_pose = realigned_pose
+                current_observation = realigned_observation
+                if current_observation is not None:
+                    last_stamp_sec = _stamp_to_float(
+                        current_observation.center_image.header.stamp
+                    )
+
+        final_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+        return current_pose, current_observation, {
+            "step_records": step_records,
+            "final_plug_translation_port": (
+                [float(value) for value in final_plug_pose_port[0]]
+                if final_plug_pose_port is not None
+                else None
+            ),
+        }
+
+    def _run_sfp_gt_tool_axis_insert(
+        self,
+        task: Task,
+        initial_pose: Pose,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        *,
+        push_schedule_m: tuple[float, ...] = (
+            0.002,
+            0.002,
+            0.003,
+            0.003,
+            0.003,
+            0.004,
+            0.004,
+        ),
+        xy_guard_tol_m: float = 0.0045,
+    ) -> tuple[Pose, Observation | None, dict[str, object]]:
+        current_pose = self._observed_tcp_pose(initial_observation, initial_pose)
+        current_observation: Observation | None = initial_observation
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        baseline_force_norm = self._force_norm(initial_observation)
+        port_frame = self._port_frame_name(task)
+        step_records: list[dict[str, object]] = []
+
+        for step_index, push_distance_m in enumerate(push_schedule_m, start=1):
+            plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            if plug_pose_port is None:
+                return current_pose, current_observation, {
+                    "message": "gt plug pose unavailable during tool-axis insert",
+                    "step_records": step_records,
+                }
+            plug_translation_port, _plug_rotation_port = plug_pose_port
+            xy_error_m = float(np.linalg.norm(plug_translation_port[:2]))
+            z_before_m = float(plug_translation_port[2])
+            if xy_error_m > xy_guard_tol_m:
+                return current_pose, current_observation, {
+                    "message": "xy error exceeded guard during tool-axis insert",
+                    "step_records": step_records,
+                    "final_plug_translation_port": [
+                        float(value) for value in plug_translation_port
+                    ],
+                }
+            if z_before_m >= -0.008:
+                break
+
+            pushed_pose = self._run_tool_axis_push(
+                move_robot,
+                current_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=push_distance_m,
+                duration_sec=0.12,
+                hold_sec=0.08,
+                debug_run=debug_run,
+                phase_prefix=f"teacher_tool_axis_insert_{step_index}",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.6,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                current_pose = self._observed_tcp_pose(next_observation, pushed_pose)
+            else:
+                current_pose = pushed_pose
+
+            updated_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            if updated_plug_pose_port is None:
+                return current_pose, current_observation, {
+                    "message": "gt plug pose lost after tool-axis insert step",
+                    "step_records": step_records,
+                }
+            updated_translation_port, _updated_rotation_port = updated_plug_pose_port
+            z_after_m = float(updated_translation_port[2])
+            actual_z_progress_m = float(z_after_m - z_before_m)
+            tracking_error_m = None
+            excess_force_norm = None
+            if current_observation is not None:
+                tracking_error_m = float(
+                    np.linalg.norm(current_observation.controller_state.tcp_error[:3])
+                )
+                excess_force_norm = self._force_norm(current_observation) - baseline_force_norm
+
+            step_records.append(
+                {
+                    "step_index": int(step_index),
+                    "push_distance_m": float(push_distance_m),
+                    "plug_translation_port_before": [
+                        float(value) for value in plug_translation_port
+                    ],
+                    "plug_translation_port_after": [
+                        float(value) for value in updated_translation_port
+                    ],
+                    "actual_z_progress_m": actual_z_progress_m,
+                    "tracking_error_m": tracking_error_m,
+                    "excess_force_norm": excess_force_norm,
+                    "pose": _pose_to_dict(current_pose),
+                }
+            )
+            debug_run.log_phase(
+                "teacher_tool_axis_insert_step",
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"step={step_index} push={push_distance_m:.4f} "
+                    f"z_before={z_before_m:.4f} z_after={z_after_m:.4f} "
+                    f"actual={actual_z_progress_m:.4f} "
+                    f"track={tracking_error_m if tracking_error_m is not None else float('nan'):.4f}"
+                ),
+            )
+
+            if tracking_error_m is not None and tracking_error_m > 0.026:
+                break
+            if excess_force_norm is not None and excess_force_norm > 8.0:
+                break
+            if actual_z_progress_m < 0.0005:
+                break
+
+            if abs(updated_translation_port[0]) > xy_guard_tol_m or abs(
+                updated_translation_port[1]
+            ) > xy_guard_tol_m:
+                realigned_pose, realigned_observation, _realign_metadata = (
+                    self._run_sfp_gt_xy_alignment(
+                        task,
+                        current_pose,
+                        current_observation
+                        if current_observation is not None
+                        else initial_observation,
+                        get_observation,
+                        move_robot,
+                        debug_run,
+                        phase_prefix=f"teacher_tool_axis_xy_realign_{step_index}",
+                        max_iterations=2,
+                        xy_success_tol_m=xy_guard_tol_m,
+                    )
+                )
+                current_pose = realigned_pose
+                current_observation = realigned_observation
+                if current_observation is not None:
+                    last_stamp_sec = _stamp_to_float(
+                        current_observation.center_image.header.stamp
+                    )
+
+        final_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+        return current_pose, current_observation, {
+            "step_records": step_records,
+            "final_plug_translation_port": (
+                [float(value) for value in final_plug_pose_port[0]]
+                if final_plug_pose_port is not None
+                else None
+            ),
+        }
+
+    def _run_sfp_gt_depth_insert_from_current_xy(
+        self,
+        task: Task,
+        initial_pose: Pose,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        *,
+        max_steps: int = 8,
+        max_step_m: float = 0.004,
+        xy_guard_tol_m: float = 0.0045,
+    ) -> tuple[Pose, Observation | None, dict[str, object]]:
+        current_pose = self._observed_tcp_pose(initial_observation, initial_pose)
+        current_observation: Observation | None = initial_observation
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        baseline_force_norm = self._force_norm(initial_observation)
+        port_frame = self._port_frame_name(task)
+        step_records: list[dict[str, object]] = []
+
+        for step_index in range(1, max_steps + 1):
+            plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            if plug_pose_port is None:
+                return current_pose, current_observation, {
+                    "message": "gt plug pose unavailable during depth insert",
+                    "step_records": step_records,
+                }
+            plug_translation_port, plug_rotation_port = plug_pose_port
+            xy_error_m = float(np.linalg.norm(plug_translation_port[:2]))
+            z_before_m = float(plug_translation_port[2])
+            if xy_error_m > xy_guard_tol_m:
+                return current_pose, current_observation, {
+                    "message": "xy error exceeded guard during depth insert",
+                    "step_records": step_records,
+                    "final_plug_translation_port": [
+                        float(value) for value in plug_translation_port
+                    ],
+                }
+            if z_before_m >= -0.008:
+                break
+
+            requested_z_progress_m = min(max_step_m, abs(z_before_m))
+            desired_translation_port = np.array(
+                [
+                    float(plug_translation_port[0]),
+                    float(plug_translation_port[1]),
+                    float(z_before_m + requested_z_progress_m),
+                ],
+                dtype=float,
+            )
+            target_pose = self._gt_teacher_gripper_pose_from_port_relative(
+                task,
+                port_frame,
+                desired_plug_translation_port=desired_translation_port,
+                desired_plug_rotation_port=plug_rotation_port,
+                slerp_fraction=1.0,
+                position_fraction=1.0,
+            )
+            if target_pose is None:
+                return current_pose, current_observation, {
+                    "message": "depth insert target unavailable",
+                    "step_records": step_records,
+                }
+
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.16,
+                debug_run=debug_run,
+                phase_name="teacher_depth_insert_move",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=0.10,
+                debug_run=debug_run,
+                phase_name="teacher_depth_insert_settle",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                current_pose = self._observed_tcp_pose(next_observation, target_pose)
+            else:
+                current_pose = target_pose
+
+            updated_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+            if updated_plug_pose_port is None:
+                return current_pose, current_observation, {
+                    "message": "gt plug pose lost after depth insert step",
+                    "step_records": step_records,
+                }
+            updated_translation_port, _updated_rotation_port = updated_plug_pose_port
+            z_after_m = float(updated_translation_port[2])
+            actual_z_progress_m = float(z_after_m - z_before_m)
+            tracking_error_m = None
+            excess_force_norm = None
+            if current_observation is not None:
+                tracking_error_m = float(
+                    np.linalg.norm(current_observation.controller_state.tcp_error[:3])
+                )
+                excess_force_norm = self._force_norm(current_observation) - baseline_force_norm
+
+            step_records.append(
+                {
+                    "step_index": int(step_index),
+                    "plug_translation_port_before": [
+                        float(value) for value in plug_translation_port
+                    ],
+                    "plug_translation_port_after": [
+                        float(value) for value in updated_translation_port
+                    ],
+                    "requested_z_progress_m": requested_z_progress_m,
+                    "actual_z_progress_m": actual_z_progress_m,
+                    "tracking_error_m": tracking_error_m,
+                    "excess_force_norm": excess_force_norm,
+                    "target_pose": _pose_to_dict(target_pose),
+                }
+            )
+            debug_run.log_phase(
+                "teacher_depth_insert_step",
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"step={step_index} z_before={z_before_m:.4f} "
+                    f"z_after={z_after_m:.4f} requested={requested_z_progress_m:.4f} "
+                    f"actual={actual_z_progress_m:.4f} "
+                    f"track={tracking_error_m if tracking_error_m is not None else float('nan'):.4f}"
+                ),
+            )
+
+            if tracking_error_m is not None and tracking_error_m > 0.020:
+                break
+            if excess_force_norm is not None and excess_force_norm > 6.0:
+                break
+            if actual_z_progress_m < max(0.0005, 0.25 * requested_z_progress_m):
+                break
+
+        final_plug_pose_port = self._gt_plug_pose_in_port_frame(task, port_frame)
+        return current_pose, current_observation, {
+            "step_records": step_records,
+            "final_plug_translation_port": (
+                [float(value) for value in final_plug_pose_port[0]]
+                if final_plug_pose_port is not None
+                else None
+            ),
+        }
+
+    def _run_sfp_gt_teacher_closure(
+        self,
+        task: Task,
+        initial_pose: Pose,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        target_z_offset: float = 0.015,
+        max_teacher_steps: int = 8,
+    ) -> tuple[Pose, Observation | None, dict[str, object]]:
+        target_pose = self._gt_teacher_gripper_pose(
+            task,
+            self._port_frame_name(task),
+            slerp_fraction=1.0,
+            position_fraction=1.0,
+            z_offset=target_z_offset,
+            reset_xy_integrator=True,
+            update_integrator=False,
+        )
+        if target_pose is None:
+            return initial_pose, initial_observation, {
+                "message": "gt teacher closure target unavailable",
+                "target_z_offset": float(target_z_offset),
+                "step_records": [],
+            }
+
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(initial_observation, initial_pose)
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        step_records: list[dict[str, object]] = []
+
+        for step_index in range(max_teacher_steps):
+            current_pose = self._observed_tcp_pose(current_observation, current_pose)
+            remaining_translation_delta, remaining_rotation_delta = self._pose_delta_base(
+                current_pose,
+                target_pose,
+            )
+            remaining_translation_norm_m = float(np.linalg.norm(remaining_translation_delta))
+            remaining_rotation_norm_rad = float(np.linalg.norm(remaining_rotation_delta))
+            if remaining_translation_norm_m < 0.015 and remaining_rotation_norm_rad < 0.08:
+                break
+
+            applied_translation_delta, applied_rotation_delta = (
+                self._clamp_sfp_teacher_step_delta(
+                    remaining_translation_delta,
+                    remaining_rotation_delta,
+                )
+            )
+            next_pose = self._apply_pose_residual_base(
+                current_pose,
+                translation_delta_base=applied_translation_delta,
+                rotation_delta_rotvec_base=applied_rotation_delta,
+            )
+            debug_run.log_command_sample(
+                "teacher_closure_step",
+                next_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"step={step_index + 1}/{max_teacher_steps} "
+                    f"remaining_t={remaining_translation_norm_m:.4f} "
+                    f"remaining_r={remaining_rotation_norm_rad:.4f}"
+                ),
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                next_pose,
+                duration_sec=0.20,
+                debug_run=debug_run,
+                phase_name=f"teacher_closure_move_{step_index + 1}",
+            )
+            self._hold_pose(
+                move_robot,
+                next_pose,
+                duration_sec=0.08,
+                debug_run=debug_run,
+                phase_name=f"teacher_closure_settle_{step_index + 1}",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                current_pose = self._observed_tcp_pose(next_observation, next_pose)
+            else:
+                current_pose = next_pose
+
+            step_records.append(
+                {
+                    "step_index": int(step_index + 1),
+                    "remaining_translation_norm_m": remaining_translation_norm_m,
+                    "remaining_rotation_norm_rad": remaining_rotation_norm_rad,
+                    "applied_translation_delta_base": [
+                        float(value) for value in applied_translation_delta
+                    ],
+                    "applied_rotation_delta_rotvec_base": [
+                        float(value) for value in applied_rotation_delta
+                    ],
+                    "pose": _pose_to_dict(current_pose),
+                }
+            )
+
+        final_remaining_translation_delta, final_remaining_rotation_delta = self._pose_delta_base(
+            current_pose,
+            target_pose,
+        )
+        return current_pose, current_observation, {
+            "target_z_offset": float(target_z_offset),
+            "target_pose": _pose_to_dict(target_pose),
+            "final_remaining_translation_norm_m": float(
+                np.linalg.norm(final_remaining_translation_delta)
+            ),
+            "final_remaining_rotation_norm_rad": float(
+                np.linalg.norm(final_remaining_rotation_delta)
+            ),
+            "step_records": step_records,
+        }
 
     def _run_stage_teacher_feasibility_v0(
         self,
@@ -4799,6 +6320,1664 @@ class QualPhasePilot(Policy):
             {"feature_summary": self._extract_feature_summary(task, refined_observation)},
         )
         self.get_logger().info(f"teacher_feasibility_v2 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v3(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v3 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v3 keeps the GT approach through teacher_insert_2, then deepens with progress-gated GT insertion instead of blind force-search handoff",
+                ],
+            }
+        )
+
+        send_feedback("teacher_feasibility_v3: GT insert + progress-gated GT insertion")
+        teacher_schedule = (
+            ("teacher_hover", 0.16, 0.38, 0.14),
+            ("teacher_preinsert_far", 0.10, 0.28, 0.10),
+            ("teacher_preinsert_mid", 0.06, 0.24, 0.10),
+            ("teacher_preinsert_near", 0.04, 0.20, 0.08),
+            ("teacher_insert_1", 0.025, 0.18, 0.08),
+            ("teacher_insert_2", 0.015, 0.16, 0.08),
+        )
+        teacher_pose, teacher_observation, teacher_metadata = self._run_sfp_gt_teacher_insert(
+            task,
+            initial_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            teacher_schedule=teacher_schedule,
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_insert",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v3 GT insert failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        teacher_pose = self._observed_tcp_pose(teacher_observation, teacher_pose)
+        baseline_force_norm = self._force_norm(initial_observation)
+        debug_run.log_phase(
+            "before_progress_gated_insert",
+            self.time_now().nanoseconds / 1e9,
+            note=f"baseline_force_norm={baseline_force_norm:.3f}",
+        )
+        final_pose, final_observation, progress_metadata = (
+            self._run_sfp_gt_progress_gated_insert(
+                task,
+                teacher_pose,
+                teacher_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                baseline_force_norm=baseline_force_norm,
+                start_z_offset=0.015,
+            )
+        )
+        debug_run.save_observation_snapshot(
+            "after_progress_gated_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "progress_metadata": progress_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v3 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v3 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v4(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v4 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v4 adds a bounded GT closure stage to actually reduce the large observed tracking gap before progress-gated insertion",
+                ],
+            }
+        )
+
+        send_feedback("teacher_feasibility_v4: GT insert + GT closure + progress-gated insertion")
+        teacher_schedule = (
+            ("teacher_hover", 0.16, 0.38, 0.14),
+            ("teacher_preinsert_far", 0.10, 0.28, 0.10),
+            ("teacher_preinsert_mid", 0.06, 0.24, 0.10),
+            ("teacher_preinsert_near", 0.04, 0.20, 0.08),
+            ("teacher_insert_1", 0.025, 0.18, 0.08),
+            ("teacher_insert_2", 0.015, 0.16, 0.08),
+        )
+        teacher_pose, teacher_observation, teacher_metadata = self._run_sfp_gt_teacher_insert(
+            task,
+            initial_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            teacher_schedule=teacher_schedule,
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_insert",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v4 GT insert failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        teacher_pose = self._observed_tcp_pose(teacher_observation, teacher_pose)
+        closure_pose, closure_observation, closure_metadata = self._run_sfp_gt_teacher_closure(
+            task,
+            teacher_pose,
+            teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            target_z_offset=0.015,
+            max_teacher_steps=8,
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_closure",
+            closure_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, closure_observation),
+                "closure_pose": _pose_to_dict(closure_pose),
+                "teacher_metadata": teacher_metadata,
+                "closure_metadata": closure_metadata,
+            },
+        )
+
+        baseline_force_norm = self._force_norm(initial_observation)
+        debug_run.log_phase(
+            "before_progress_gated_insert",
+            self.time_now().nanoseconds / 1e9,
+            note=f"baseline_force_norm={baseline_force_norm:.3f}",
+        )
+        final_pose, final_observation, progress_metadata = (
+            self._run_sfp_gt_progress_gated_insert(
+                task,
+                closure_pose,
+                closure_observation if closure_observation is not None else teacher_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                baseline_force_norm=baseline_force_norm,
+                start_z_offset=0.015,
+            )
+        )
+        debug_run.save_observation_snapshot(
+            "after_progress_gated_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "closure_metadata": closure_metadata,
+                "progress_metadata": progress_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v4 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v4 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v5(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v5 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v5 replaces fixed-duration GT phase hops with adaptive per-phase closure so the commanded GT schedule does not outrun the actual TCP",
+                ],
+            }
+        )
+
+        send_feedback(
+            "teacher_feasibility_v5: adaptive GT phase closure + progress-gated GT insertion"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_adaptive(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_insert",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v5 adaptive GT insert failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        baseline_force_norm = self._force_norm(initial_observation)
+        debug_run.log_phase(
+            "before_progress_gated_insert",
+            self.time_now().nanoseconds / 1e9,
+            note=f"baseline_force_norm={baseline_force_norm:.3f}",
+        )
+        final_pose, final_observation, progress_metadata = (
+            self._run_sfp_gt_progress_gated_insert(
+                task,
+                teacher_pose,
+                teacher_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                baseline_force_norm=baseline_force_norm,
+                start_z_offset=0.015,
+            )
+        )
+        debug_run.save_observation_snapshot(
+            "after_progress_gated_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "progress_metadata": progress_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v5 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v5 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v6(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v6 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v6 adds an explicit GT x/y alignment phase before progress-gated insertion because bag analysis showed the teacher was entering with about 15mm of lateral error",
+                ],
+            }
+        )
+
+        send_feedback(
+            "teacher_feasibility_v6: adaptive GT phase closure + GT xy align + progress-gated GT insertion"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_adaptive(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_insert",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v6 adaptive GT insert failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment(
+            task,
+            teacher_pose,
+            teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        debug_run.save_observation_snapshot(
+            "after_xy_align",
+            xy_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, xy_observation),
+                "teacher_metadata": teacher_metadata,
+                "xy_pose": _pose_to_dict(xy_pose),
+                "xy_metadata": xy_metadata,
+            },
+        )
+
+        baseline_force_norm = self._force_norm(initial_observation)
+        debug_run.log_phase(
+            "before_progress_gated_insert",
+            self.time_now().nanoseconds / 1e9,
+            note=f"baseline_force_norm={baseline_force_norm:.3f}",
+        )
+        final_pose, final_observation, progress_metadata = (
+            self._run_sfp_gt_progress_gated_insert(
+                task,
+                xy_pose,
+                xy_observation if xy_observation is not None else teacher_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                baseline_force_norm=baseline_force_norm,
+                start_z_offset=0.015,
+            )
+        )
+        debug_run.save_observation_snapshot(
+            "after_progress_gated_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "xy_metadata": xy_metadata,
+                "progress_metadata": progress_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v6 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v6 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v7(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v7 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v7 keeps the v6 xy-alignment and replaces the 6cm one-shot GT push with small-step GT insertion driven by plug z progress in the port frame",
+                ],
+            }
+        )
+
+        send_feedback(
+            "teacher_feasibility_v7: adaptive GT phase closure + GT xy align + small-step GT insertion"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_adaptive(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_insert",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v7 adaptive GT insert failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment(
+            task,
+            teacher_pose,
+            teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        debug_run.save_observation_snapshot(
+            "after_xy_align",
+            xy_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, xy_observation),
+                "teacher_metadata": teacher_metadata,
+                "xy_pose": _pose_to_dict(xy_pose),
+                "xy_metadata": xy_metadata,
+            },
+        )
+
+        final_pose, final_observation, insert_metadata = self._run_sfp_gt_incremental_insert(
+            task,
+            xy_pose,
+            xy_observation if xy_observation is not None else teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        debug_run.save_observation_snapshot(
+            "after_incremental_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "xy_metadata": xy_metadata,
+                "insert_metadata": insert_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v7 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v7 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v8(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v8 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v8 keeps the v6 xy-alignment and replaces absolute GT depth targets with bounded tool-axis pushes validated by GT plug z progress",
+                ],
+            }
+        )
+
+        send_feedback(
+            "teacher_feasibility_v8: adaptive GT phase closure + GT xy align + tool-axis bounded insert"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_adaptive(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_insert",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v8 adaptive GT insert failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment(
+            task,
+            teacher_pose,
+            teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        debug_run.save_observation_snapshot(
+            "after_xy_align",
+            xy_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, xy_observation),
+                "teacher_metadata": teacher_metadata,
+                "xy_pose": _pose_to_dict(xy_pose),
+                "xy_metadata": xy_metadata,
+            },
+        )
+
+        final_pose, final_observation, insert_metadata = self._run_sfp_gt_tool_axis_insert(
+            task,
+            xy_pose,
+            xy_observation if xy_observation is not None else teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        debug_run.save_observation_snapshot(
+            "after_tool_axis_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "xy_metadata": xy_metadata,
+                "insert_metadata": insert_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v8 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v8 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v9(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v9 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v9 stops the GT approach at a shallower pre-insert pose, performs bounded GT xy alignment on actual plug coordinates, then applies smaller tool-axis pushes",
+                ],
+            }
+        )
+
+        shallow_teacher_schedule = (
+            ("teacher_hover", 0.16, 0.24, 0.12),
+            ("teacher_preinsert_far", 0.10, 0.22, 0.12),
+            ("teacher_preinsert_mid", 0.06, 0.22, 0.12),
+            ("teacher_preinsert_near", 0.04, 0.20, 0.12),
+            ("teacher_insert_1", 0.025, 0.18, 0.12),
+        )
+
+        send_feedback(
+            "teacher_feasibility_v9: shallow GT approach + bounded GT xy alignment + small tool-axis insert"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_adaptive(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                teacher_schedule=shallow_teacher_schedule,
+            )
+        )
+        teacher_plug_pose_port = self._gt_plug_pose_in_port_frame(
+            task, self._port_frame_name(task)
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_insert_shallow",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+                "teacher_plug_translation_port": (
+                    [float(value) for value in teacher_plug_pose_port[0]]
+                    if teacher_plug_pose_port is not None
+                    else None
+                ),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v9 shallow GT insert failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment_bounded(
+            task,
+            teacher_pose,
+            teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            max_iterations=8,
+            xy_success_tol_m=0.0045,
+            max_axis_step_m=0.003,
+            move_duration_sec=0.16,
+            hold_duration_sec=0.10,
+        )
+        debug_run.save_observation_snapshot(
+            "after_xy_align_bounded",
+            xy_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, xy_observation),
+                "teacher_metadata": teacher_metadata,
+                "xy_pose": _pose_to_dict(xy_pose),
+                "xy_metadata": xy_metadata,
+            },
+        )
+
+        final_pose, final_observation, insert_metadata = self._run_sfp_gt_tool_axis_insert(
+            task,
+            xy_pose,
+            xy_observation if xy_observation is not None else teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            push_schedule_m=(0.0015, 0.0015, 0.0020, 0.0020, 0.0025, 0.0025),
+        )
+        debug_run.save_observation_snapshot(
+            "after_tool_axis_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "xy_metadata": xy_metadata,
+                "insert_metadata": insert_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v9 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v9 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v10(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v10 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v10 stops GT approach on force/tracking gates, unloads slightly, then attempts bounded GT xy alignment before insertion",
+                ],
+            }
+        )
+
+        send_feedback(
+            "teacher_feasibility_v10: force-gated GT approach + unload + bounded GT xy alignment"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_until_contact(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                stop_excess_force_norm=6.0,
+                stop_tracking_error_m=0.006,
+            )
+        )
+        teacher_plug_pose_port = self._gt_plug_pose_in_port_frame(
+            task, self._port_frame_name(task)
+        )
+        debug_run.save_observation_snapshot(
+            "after_force_gated_gt_insert",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+                "teacher_plug_translation_port": (
+                    [float(value) for value in teacher_plug_pose_port[0]]
+                    if teacher_plug_pose_port is not None
+                    else None
+                ),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v10 force-gated GT approach failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        baseline_force_value = teacher_metadata.get("baseline_force_norm", 0.0)
+        baseline_force_norm = (
+            float(baseline_force_value)
+            if isinstance(baseline_force_value, (int, float))
+            else 0.0
+        )
+        current_force_norm = self._force_norm(teacher_observation)
+        excess_force_norm = current_force_norm - baseline_force_norm
+        pre_xy_pose = teacher_pose
+        pre_xy_observation = teacher_observation
+        retreat_metadata: dict[str, object] | None = None
+        if excess_force_norm > 3.5:
+            retreat_distance_m = -0.002
+            retreat_pose = self._run_tool_axis_push(
+                move_robot,
+                teacher_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=retreat_distance_m,
+                duration_sec=0.12,
+                hold_sec=0.10,
+                debug_run=debug_run,
+                phase_prefix="teacher_force_gate_unload",
+            )
+            retreat_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=_stamp_to_float(teacher_observation.center_image.header.stamp),
+            )
+            if retreat_observation is not None:
+                pre_xy_observation = retreat_observation
+                pre_xy_pose = self._observed_tcp_pose(retreat_observation, retreat_pose)
+            else:
+                pre_xy_pose = retreat_pose
+            retreat_plug_pose_port = self._gt_plug_pose_in_port_frame(
+                task, self._port_frame_name(task)
+            )
+            retreat_metadata = {
+                "retreat_distance_m": retreat_distance_m,
+                "force_norm_before": current_force_norm,
+                "force_norm_after": (
+                    self._force_norm(pre_xy_observation)
+                    if pre_xy_observation is not None
+                    else None
+                ),
+                "plug_translation_port_after": (
+                    [float(value) for value in retreat_plug_pose_port[0]]
+                    if retreat_plug_pose_port is not None
+                    else None
+                ),
+            }
+            debug_run.save_observation_snapshot(
+                "after_force_gate_unload",
+                pre_xy_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, pre_xy_observation),
+                    "teacher_metadata": teacher_metadata,
+                    "retreat_metadata": retreat_metadata,
+                },
+            )
+
+        xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment_bounded(
+            task,
+            pre_xy_pose,
+            pre_xy_observation if pre_xy_observation is not None else teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            max_iterations=10,
+            xy_success_tol_m=0.0045,
+            max_axis_step_m=0.0025,
+            move_duration_sec=0.18,
+            hold_duration_sec=0.12,
+            max_tracking_error_m=0.012,
+            max_excess_force_norm=5.0,
+        )
+        debug_run.save_observation_snapshot(
+            "after_xy_align_bounded",
+            xy_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, xy_observation),
+                "teacher_metadata": teacher_metadata,
+                "retreat_metadata": retreat_metadata,
+                "xy_pose": _pose_to_dict(xy_pose),
+                "xy_metadata": xy_metadata,
+            },
+        )
+
+        final_pose, final_observation, insert_metadata = self._run_sfp_gt_tool_axis_insert(
+            task,
+            xy_pose,
+            xy_observation if xy_observation is not None else pre_xy_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            push_schedule_m=(0.0010, 0.0010, 0.0015, 0.0015, 0.0020, 0.0020),
+        )
+        debug_run.save_observation_snapshot(
+            "after_tool_axis_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "retreat_metadata": retreat_metadata,
+                "xy_metadata": xy_metadata,
+                "insert_metadata": insert_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v10 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v10 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v11(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v11 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v11 stops at preinsert_near, then attempts bounded GT xy alignment before tool-axis pushes",
+                ],
+            }
+        )
+
+        preinsert_schedule = (
+            ("teacher_hover", 0.16, 0.24, 0.12),
+            ("teacher_preinsert_far", 0.10, 0.22, 0.12),
+            ("teacher_preinsert_mid", 0.06, 0.22, 0.12),
+            ("teacher_preinsert_near", 0.04, 0.20, 0.12),
+        )
+        send_feedback(
+            "teacher_feasibility_v11: stop at preinsert_near + bounded GT xy alignment"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_adaptive(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                teacher_schedule=preinsert_schedule,
+            )
+        )
+        teacher_plug_pose_port = self._gt_plug_pose_in_port_frame(
+            task, self._port_frame_name(task)
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_preinsert_near",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+                "teacher_plug_translation_port": (
+                    [float(value) for value in teacher_plug_pose_port[0]]
+                    if teacher_plug_pose_port is not None
+                    else None
+                ),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v11 preinsert approach failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment_bounded(
+            task,
+            teacher_pose,
+            teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            max_iterations=10,
+            xy_success_tol_m=0.0045,
+            max_axis_step_m=0.004,
+            move_duration_sec=0.20,
+            hold_duration_sec=0.12,
+            max_tracking_error_m=0.010,
+            max_excess_force_norm=6.0,
+        )
+        debug_run.save_observation_snapshot(
+            "after_xy_align_bounded",
+            xy_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, xy_observation),
+                "teacher_metadata": teacher_metadata,
+                "xy_pose": _pose_to_dict(xy_pose),
+                "xy_metadata": xy_metadata,
+            },
+        )
+
+        final_pose, final_observation, insert_metadata = self._run_sfp_gt_tool_axis_insert(
+            task,
+            xy_pose,
+            xy_observation if xy_observation is not None else teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            push_schedule_m=(0.0015, 0.0015, 0.0020, 0.0020, 0.0025, 0.0025, 0.0030),
+        )
+        debug_run.save_observation_snapshot(
+            "after_tool_axis_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "xy_metadata": xy_metadata,
+                "insert_metadata": insert_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v11 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v11 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v12(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v12 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v12 stops at preinsert_near and attempts GT depth targets while preserving the current plug x/y alignment",
+                ],
+            }
+        )
+
+        preinsert_schedule = (
+            ("teacher_hover", 0.16, 0.24, 0.12),
+            ("teacher_preinsert_far", 0.10, 0.22, 0.12),
+            ("teacher_preinsert_mid", 0.06, 0.22, 0.12),
+            ("teacher_preinsert_near", 0.04, 0.20, 0.12),
+        )
+        send_feedback(
+            "teacher_feasibility_v12: preinsert_near + preserve-xy GT depth insert"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_adaptive(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                teacher_schedule=preinsert_schedule,
+            )
+        )
+        teacher_plug_pose_port = self._gt_plug_pose_in_port_frame(
+            task, self._port_frame_name(task)
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_preinsert_near",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+                "teacher_plug_translation_port": (
+                    [float(value) for value in teacher_plug_pose_port[0]]
+                    if teacher_plug_pose_port is not None
+                    else None
+                ),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v12 preinsert approach failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment_bounded(
+            task,
+            teacher_pose,
+            teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            max_iterations=10,
+            xy_success_tol_m=0.0045,
+            max_axis_step_m=0.004,
+            move_duration_sec=0.20,
+            hold_duration_sec=0.12,
+            max_tracking_error_m=0.010,
+            max_excess_force_norm=6.0,
+        )
+        debug_run.save_observation_snapshot(
+            "after_xy_align_bounded",
+            xy_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, xy_observation),
+                "teacher_metadata": teacher_metadata,
+                "xy_pose": _pose_to_dict(xy_pose),
+                "xy_metadata": xy_metadata,
+            },
+        )
+
+        final_pose, final_observation, insert_metadata = self._run_sfp_gt_depth_insert_from_current_xy(
+            task,
+            xy_pose,
+            xy_observation if xy_observation is not None else teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        debug_run.save_observation_snapshot(
+            "after_depth_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "xy_metadata": xy_metadata,
+                "insert_metadata": insert_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v12 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v12 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v13(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v13 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v13 keeps the v12 preinsert_near entry, replaces the overly conservative bounded x/y step with GT x/y closure, and then deepens with dense GT depth phases",
+                ],
+            }
+        )
+
+        preinsert_schedule = (
+            ("teacher_hover", 0.16, 0.24, 0.12),
+            ("teacher_preinsert_far", 0.10, 0.22, 0.12),
+            ("teacher_preinsert_mid", 0.06, 0.22, 0.12),
+            ("teacher_preinsert_near", 0.04, 0.20, 0.12),
+        )
+        send_feedback(
+            "teacher_feasibility_v13: preinsert_near + GT xy closure + dense GT depth phases"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_adaptive(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                teacher_schedule=preinsert_schedule,
+            )
+        )
+        teacher_plug_pose_port = self._gt_plug_pose_in_port_frame(
+            task, self._port_frame_name(task)
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_preinsert_near",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+                "teacher_plug_translation_port": (
+                    [float(value) for value in teacher_plug_pose_port[0]]
+                    if teacher_plug_pose_port is not None
+                    else None
+                ),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v13 preinsert approach failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment(
+            task,
+            teacher_pose,
+            teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            phase_prefix="teacher_xy_align_v13",
+            max_iterations=8,
+            xy_success_tol_m=0.0045,
+        )
+        debug_run.save_observation_snapshot(
+            "after_xy_align",
+            xy_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, xy_observation),
+                "teacher_metadata": teacher_metadata,
+                "xy_pose": _pose_to_dict(xy_pose),
+                "xy_metadata": xy_metadata,
+            },
+        )
+
+        dense_depth_schedule = (
+            ("teacher_depth_gt_1", 0.032, 0.18, 0.10),
+            ("teacher_depth_gt_2", 0.026, 0.18, 0.10),
+            ("teacher_depth_gt_3", 0.020, 0.18, 0.10),
+            ("teacher_depth_gt_4", 0.015, 0.18, 0.10),
+            ("teacher_depth_gt_5", 0.010, 0.18, 0.12),
+            ("teacher_depth_gt_6", 0.006, 0.18, 0.12),
+            ("teacher_depth_gt_7", 0.003, 0.18, 0.12),
+            ("teacher_depth_gt_8", 0.000, 0.18, 0.14),
+        )
+        final_pose, final_observation, depth_metadata = self._run_sfp_gt_teacher_insert_adaptive(
+            task,
+            xy_observation if xy_observation is not None else teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            teacher_schedule=dense_depth_schedule,
+        )
+        final_plug_pose_port = self._gt_plug_pose_in_port_frame(
+            task, self._port_frame_name(task)
+        )
+        debug_run.save_observation_snapshot(
+            "after_dense_gt_depth",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": None if final_pose is None else _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "xy_metadata": xy_metadata,
+                "depth_metadata": depth_metadata,
+                "final_plug_translation_port": (
+                    [float(value) for value in final_plug_pose_port[0]]
+                    if final_plug_pose_port is not None
+                    else None
+                ),
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v13 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v13 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v14(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v14 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v14 uses preinsert_near, then chooses a stronger GT x/y closure only when the preinsert lateral error is large, and keeps the better v12-style single depth step",
+                ],
+            }
+        )
+
+        preinsert_schedule = (
+            ("teacher_hover", 0.16, 0.24, 0.12),
+            ("teacher_preinsert_far", 0.10, 0.22, 0.12),
+            ("teacher_preinsert_mid", 0.06, 0.22, 0.12),
+            ("teacher_preinsert_near", 0.04, 0.20, 0.12),
+        )
+        send_feedback(
+            "teacher_feasibility_v14: preinsert_near + conditional GT xy correction + single GT depth insert"
+        )
+        teacher_pose, teacher_observation, teacher_metadata = (
+            self._run_sfp_gt_teacher_insert_adaptive(
+                task,
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                teacher_schedule=preinsert_schedule,
+            )
+        )
+        teacher_plug_pose_port = self._gt_plug_pose_in_port_frame(
+            task, self._port_frame_name(task)
+        )
+        teacher_plug_translation_port = (
+            None if teacher_plug_pose_port is None else teacher_plug_pose_port[0]
+        )
+        xy_error_m = (
+            None
+            if teacher_plug_translation_port is None
+            else float(np.linalg.norm(teacher_plug_translation_port[:2]))
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_preinsert_near",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+                "teacher_plug_translation_port": (
+                    None
+                    if teacher_plug_translation_port is None
+                    else [float(value) for value in teacher_plug_translation_port]
+                ),
+                "preinsert_xy_error_m": xy_error_m,
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v14 preinsert approach failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        if xy_error_m is not None and xy_error_m > 0.010:
+            xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment(
+                task,
+                teacher_pose,
+                teacher_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                phase_prefix="teacher_xy_align_v14",
+                max_iterations=8,
+                xy_success_tol_m=0.0045,
+            )
+            xy_mode = "gt_xy_closure"
+        else:
+            xy_pose, xy_observation, xy_metadata = self._run_sfp_gt_xy_alignment_bounded(
+                task,
+                teacher_pose,
+                teacher_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                max_iterations=10,
+                xy_success_tol_m=0.0045,
+                max_axis_step_m=0.004,
+                move_duration_sec=0.20,
+                hold_duration_sec=0.12,
+                max_tracking_error_m=0.010,
+                max_excess_force_norm=6.0,
+            )
+            xy_mode = "bounded_xy"
+        debug_run.save_observation_snapshot(
+            "after_xy_align",
+            xy_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, xy_observation),
+                "teacher_metadata": teacher_metadata,
+                "xy_pose": _pose_to_dict(xy_pose),
+                "xy_metadata": xy_metadata,
+                "xy_mode": xy_mode,
+            },
+        )
+
+        final_pose, final_observation, insert_metadata = self._run_sfp_gt_depth_insert_from_current_xy(
+            task,
+            xy_pose,
+            xy_observation if xy_observation is not None else teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        final_plug_pose_port = self._gt_plug_pose_in_port_frame(
+            task, self._port_frame_name(task)
+        )
+        debug_run.save_observation_snapshot(
+            "after_depth_insert",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "xy_metadata": xy_metadata,
+                "xy_mode": xy_mode,
+                "insert_metadata": insert_metadata,
+                "final_plug_translation_port": (
+                    [float(value) for value in final_plug_pose_port[0]]
+                    if final_plug_pose_port is not None
+                    else None
+                ),
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v14 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v14 artifacts saved to {debug_run.root}")
         return True
 
     def _run_stage_submission_safe_v17(
@@ -9631,6 +12810,54 @@ class QualPhasePilot(Policy):
             )
         if self._stage == "teacher_feasibility_v2":
             return self._run_stage_teacher_feasibility_v2(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v3":
+            return self._run_stage_teacher_feasibility_v3(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v4":
+            return self._run_stage_teacher_feasibility_v4(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v5":
+            return self._run_stage_teacher_feasibility_v5(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v6":
+            return self._run_stage_teacher_feasibility_v6(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v7":
+            return self._run_stage_teacher_feasibility_v7(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v8":
+            return self._run_stage_teacher_feasibility_v8(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v9":
+            return self._run_stage_teacher_feasibility_v9(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v10":
+            return self._run_stage_teacher_feasibility_v10(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v11":
+            return self._run_stage_teacher_feasibility_v11(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v12":
+            return self._run_stage_teacher_feasibility_v12(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v13":
+            return self._run_stage_teacher_feasibility_v13(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v14":
+            return self._run_stage_teacher_feasibility_v14(
                 task, get_observation, move_robot, send_feedback
             )
 

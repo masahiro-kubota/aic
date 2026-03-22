@@ -15,6 +15,7 @@
 #
 
 from dataclasses import dataclass
+import time
 
 import numpy as np
 from geometry_msgs.msg import Point, Pose, Quaternion
@@ -297,7 +298,7 @@ class PublicTrialPosePilot(Policy):
                 move_robot=move_robot,
                 pose=self._interpolate_pose(start_pose, end_pose, fraction),
             )
-            self.sleep_for(update_period_sec)
+            self._wait_for_sim_progress(update_period_sec)
 
     def _hold_pose(
         self,
@@ -309,7 +310,27 @@ class PublicTrialPosePilot(Policy):
         steps = max(1, int(duration_sec / update_period_sec))
         for _ in range(steps):
             self.set_pose_target(move_robot=move_robot, pose=pose)
-            self.sleep_for(update_period_sec)
+            self._wait_for_sim_progress(update_period_sec)
+
+    def _wait_for_sim_progress(
+        self,
+        duration_sec: float,
+        wall_timeout_scale: float = 8.0,
+        min_wall_timeout_sec: float = 0.25,
+        poll_period_sec: float = 0.01,
+    ) -> bool:
+        if duration_sec <= 0.0:
+            return True
+        start_sim_sec = self.time_now().nanoseconds / 1e9
+        deadline = time.monotonic() + max(
+            min_wall_timeout_sec, duration_sec * wall_timeout_scale
+        )
+        while time.monotonic() < deadline:
+            sim_elapsed_sec = self.time_now().nanoseconds / 1e9 - start_sim_sec
+            if sim_elapsed_sec + 1e-4 >= duration_sec:
+                return True
+            time.sleep(poll_period_sec)
+        return False
 
     def _replay_sc_trajectory(self, move_robot: MoveRobotCallback) -> None:
         replay_poses = [self._pose_from_replay_row(row) for row in SC_REPLAY_TRAJECTORY]
@@ -324,6 +345,19 @@ class PublicTrialPosePilot(Policy):
                 duration_sec=max(0.05, next_time - current_time),
             )
         self._hold_pose(move_robot, replay_poses[-1], duration_sec=self._SC_FINAL_HOLD_SEC)
+
+    def _replay_sc_trajectory_walltime(self, move_robot: MoveRobotCallback) -> None:
+        replay_poses = [self._pose_from_replay_row(row) for row in SC_REPLAY_TRAJECTORY]
+        self.set_pose_target(move_robot=move_robot, pose=replay_poses[0])
+        for idx in range(len(SC_REPLAY_TRAJECTORY) - 1):
+            current_time = SC_REPLAY_TRAJECTORY[idx][0]
+            next_time = SC_REPLAY_TRAJECTORY[idx + 1][0]
+            self.set_pose_target(move_robot=move_robot, pose=replay_poses[idx + 1])
+            time.sleep(max(0.02, next_time - current_time))
+        hold_steps = max(1, int(self._SC_FINAL_HOLD_SEC / 0.05))
+        for _ in range(hold_steps):
+            self.set_pose_target(move_robot=move_robot, pose=replay_poses[-1])
+            time.sleep(0.05)
 
     def insert_cable(
         self,
@@ -344,14 +378,16 @@ class PublicTrialPosePilot(Policy):
             current_pose = self._pose_from_observation(get_observation)
             if current_pose is not None:
                 break
-            self.sleep_for(0.05)
+            time.sleep(0.05)
         if current_pose is None:
             self.get_logger().error("Failed to get an initial observation.")
             return False
 
         if task.plug_type == "sc":
             send_feedback("replaying SC public-trial trajectory")
-            self._replay_sc_trajectory(move_robot)
+            # Use wall time for the long SC replay so shutdown/timing jitter
+            # does not stretch the trajectory enough to hit outer wrapper timeouts.
+            self._replay_sc_trajectory_walltime(move_robot)
             self.get_logger().info("PublicTrialPosePilot.insert_cable() exiting...")
             return True
 
