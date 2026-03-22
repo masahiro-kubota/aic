@@ -343,3 +343,74 @@ It should stay concise enough to scan quickly.
   - `a follow-up full-run probe started with the same v8 code but reached only 48.949048 + 41.896870 = 90.845918 after the first two SFP trials, meaning trial_3 would have needed 35.73614255565613 points just to match S2; that was already above the SC-only v8 result, so the run was aborted`
 - Next action:
   - `keep S2 as the promoted best run and do not advance v8 without reducing its time cost and explaining the unexpected SFP regression`
+
+## 2026-03-22 11:56 JST - P0 `center_uvz` Larger Balanced Model Gate
+
+- Commit: `uncommitted`
+- Milestone: `P0`
+- Submission-safe: `yes`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=submission_safe_v11`, `SFP-only` config [sfp_trials_only.yaml](/home/masa/ws_aic/src/aic/aic_engine/config/sfp_trials_only.yaml), headless eval via `/entrypoint.sh`, `ground_truth:=false`, `DISPLAY=:1`, learned SFP model `/home/masa/ws_aic_runtime/learned_port_models/sfp_centeruvz_rand20_allphases_v0_20260322`
+- Score total: `71.320068644735088`
+- Score by trial: `t1=35.220362710871615`, `t2=36.099705933863473`
+- Artifacts:
+  - `/home/masa/aic_results/qual_submission_safe_v11_20260322_115655/eval.log`
+  - `/home/masa/aic_results/qual_submission_safe_v11_20260322_115655/model.log`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_115844_submission_safe_v11_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_120151_submission_safe_v11_task_1`
+- What worked:
+  - `the 840-sample retrained model moved reliably and completed both SFP trials`
+  - `the runtime aux-vector bug was fixed, so the learned branch was no longer stuck at score 2`
+- What failed:
+  - `the new learned SFP route still scored far below the old SFP-pair baseline of 97.19285406208354`
+  - `both trials remained proximity-only and never crossed into insertion scoring`
+- Next action:
+  - `stop treating center_uvz-only as the mainline and switch the PDCA loop to teacher-feasibility gating`
+
+## 2026-03-22 12:08 JST - T0 Randomized SFP GT Teacher Feasibility v0
+
+- Commit: `uncommitted`
+- Milestone: `T0`
+- Submission-safe: `no`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=teacher_feasibility_v0`, randomized `SFP-only` config `/home/masa/ws_aic_runtime/generated_configs/t0_teacher_sfp_rand2_seed91.yaml`, headless eval via `/entrypoint.sh`, `ground_truth:=true`, `DISPLAY=:1`
+- Score total: `86.653740214899685`
+- Score by trial: `t1=41.779318087841951`, `t2=44.874422127057734`
+- Artifacts:
+  - `/home/masa/aic_results/qual_teacher_feasibility_v0_20260322_120830/scoring.yaml`
+  - `/home/masa/aic_results/qual_teacher_feasibility_v0_20260322_120830/eval.log`
+  - `/home/masa/aic_results/qual_teacher_feasibility_v0_20260322_120830/model.log`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_121027_teacher_feasibility_v0_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_121403_teacher_feasibility_v0_task_1`
+- What worked:
+  - `both randomized SFP tasks completed successfully under a ground-truth teacher`
+  - `trial_2 reached a final plug-port distance of 0.03 m, showing the teacher can approach the port mouth closely`
+- What failed:
+  - `the teacher still missed the T0 gate badly, reaching only 86.65 / 200 instead of the required 150 / 200`
+  - `the terminal push phase remained proximity-led and did not generate insertion events`
+- Next action:
+  - `replace the fixed terminal push with a more insertion-aware GT near-contact controller before collecting any student data`
+
+## 2026-03-22 12:18 JST - T0 Randomized SFP GT Teacher Feasibility v1
+
+- Commit: `uncommitted`
+- Milestone: `T0`
+- Submission-safe: `no`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=teacher_feasibility_v0`, same randomized `SFP-only` config `/home/masa/ws_aic_runtime/generated_configs/t0_teacher_sfp_rand2_seed91.yaml`, headless eval via `/entrypoint.sh`, `ground_truth:=true`, `DISPLAY=:1`, plus a GT terminal-contact loop before the final push
+- Score total: `86.562241559624113`
+- Score by trial: `t1=42.659702234323316`, `t2=43.902539325300786`
+- Artifacts:
+  - `/home/masa/aic_results/qual_teacher_feasibility_v0_20260322_121820/scoring.yaml`
+  - `/home/masa/aic_results/qual_teacher_feasibility_v0_20260322_121820/eval.log`
+  - `/home/masa/aic_results/qual_teacher_feasibility_v0_20260322_121820/model.log`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_122017_teacher_feasibility_v0_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_122244_teacher_feasibility_v0_task_1`
+- What worked:
+  - `the GT terminal-contact loop slightly improved trial_1 tier-3 proximity`
+  - `the revised teacher still completed both randomized SFP tasks cleanly`
+- What failed:
+  - `the total score was effectively unchanged, so the added GT terminal loop did not solve insertion`
+  - `the teacher still stayed proximity-led and therefore still failed the 150 / 200 T0 gate`
+- Next action:
+  - `redesign the GT teacher around lower-jerk, axis-aware, recovery-capable near-contact insertion instead of collecting more student labels`

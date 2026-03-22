@@ -1210,3 +1210,269 @@ A strategy should be considered promising only if it:
 - remains functional under randomized board and component placement
 - works for both SFP and SC with the same policy framework
 - improves score without relying on public-sample overfitting
+
+## Pivot Plan If `center_uvz` Stalls
+
+If the `center_uvz`-only route fails to beat the best legal baseline, do not
+keep tuning it with small parameter changes. The next mainline should switch to
+teacher-guided insertion.
+
+### Why This Pivot Exists
+
+The current `center_uvz` path only improves target acquisition. It does not
+directly represent:
+
+- insertion axis
+- plug roll about the insertion axis
+- near-contact correction conditioned on wrench and image evidence
+- recovery when the plug drifts or loses the mouth of the port
+
+That limitation makes it hard to cross the scoring cliff from `Tier 3 proximity`
+to `Tier 3 insertion success`. A policy that predicts only a point in the image
+is unlikely to deliver consistent `80+` scores per trial.
+
+### Pivot Goal
+
+The pivot target is not "a slightly better proximity score".
+
+The pivot target is:
+
+- `SFP >= 80` per trial
+- `SC >= 80` per trial
+- insertion-driven scores, not Tier 2 polishing
+
+This means the new route must focus on producing reliable insertion events.
+
+### Core Strategy
+
+Use learning for the part that matters most:
+
+- estimate a local insertion frame from official observations
+- then run a teacher-guided closed-loop insertion policy in that local frame
+
+The runtime stack should become:
+
+1. coarse legal acquisition
+2. local port-frame estimation
+3. bounded pre-insertion motion
+4. teacher-guided insertion near contact
+5. recovery and retry if confidence or contact pattern is wrong
+
+This keeps the system debuggable while moving the learned part to the place
+where the score cliff actually is.
+
+### What The New Model Should Predict
+
+The new learned representation should not stop at `center_uvz`.
+
+It should predict a task-conditioned local insertion frame:
+
+- a point on the port mouth or insertion axis
+- insertion axis direction
+- roll or a roll proxy for plug orientation
+- confidence for whether near-contact insertion should start
+
+Near contact, a second learned head or second model should predict bounded
+teacher-guided local actions:
+
+- lateral correction in the port-local frame
+- insertion-axis correction
+- small rotational correction
+- optional backoff / retry trigger
+
+### Data Collection Plan
+
+Do not train this route on sparse target labels alone. Collect dense
+teacher-guided insertion trajectories.
+
+For each randomized trial, save:
+
+- three wrist camera images
+- task fields
+- current TCP pose
+- current wrench
+- legal feature summary
+- ground-truth port frame for offline labels only
+- teacher hover pose
+- teacher pre-insert pose
+- teacher insert pose
+- dense intermediate teacher waypoints near contact
+- success / failure / recovery outcome
+
+The dataset must include:
+
+- successful insertions
+- near-miss insertions
+- recoverable bad approaches
+- explicit negative examples where pushing should stop
+
+### Teacher Definition
+
+The teacher should be deterministic and stage-based, not an opaque policy.
+
+The teacher controller should use ground-truth offline only to generate:
+
+- stable hover
+- aligned pre-insertion
+- low-speed insertion with bounded force
+- backoff and reacquire when insertion diverges
+
+This has two advantages:
+
+- it makes the training target interpretable
+- it exposes whether the controller is capable of `80+` even with perfect state
+
+If the teacher itself cannot score well on randomized trials, fix the teacher
+before training the student.
+
+### Stage Gates
+
+The pivot should move through these gates in order.
+
+#### T0. Teacher Feasibility
+
+Goal:
+
+- prove that a ground-truth teacher can score at an insertion level on
+  randomized SFP
+
+Gate:
+
+- randomized `SFP` teacher trials must reach at least `150 / 200` combined
+  before any student training is trusted
+
+If this fails, the problem is controller design, not learning.
+
+Current status on 2026-03-22:
+
+- `center_uvz` rerun with the larger balanced model still failed the pre-pivot
+  gate, scoring only `71.320068644735088 / 200` on `SFP-only`
+- `teacher_feasibility_v0` was then introduced to test a runtime GT teacher on
+  randomized `SFP`
+- the first GT-teacher run scored `86.653740214899685 / 200`
+- a second run with an added GT terminal-contact loop scored
+  `86.562241559624113 / 200`
+
+Interpretation:
+
+- `center_uvz-only` is no longer the mainline
+- the current GT teacher also fails the `150 / 200` feasibility gate
+- therefore the next bottleneck is still teacher/controller design, not student
+  learning
+
+#### T1. Dense Teacher Dataset
+
+Goal:
+
+- collect a balanced randomized dataset with successful and failed insertion
+  traces for both `SFP` and `SC`
+
+Gate:
+
+- enough data to cover all SFP rails repeatedly
+- enough `SC` variation to prevent memorizing one public configuration
+
+Practical first target:
+
+- `SFP`: at least `100` successful teacher trials
+- `SC`: at least `100` successful teacher trials
+
+#### T2. Local Frame Estimator
+
+Goal:
+
+- replace `center_uvz` with a learned local insertion-frame estimator
+
+Gate:
+
+- online pre-insertion should beat the old `center_uvz` route on SFP
+- if not, do not proceed to insertion learning
+
+Expected online target:
+
+- `SFP-only` score should clearly beat the `submission_safe_v11` bug-fixed
+  result and approach or exceed the old `S2` SFP pair
+
+#### T3. Teacher-Guided SFP Insertion
+
+Goal:
+
+- train a bounded local policy that starts only after pre-insertion is good
+
+Gate:
+
+- `SFP` should cross from proximity into repeated insertion events
+- target combined score should exceed `160 / 200`
+
+If this gate fails, the problem is likely the local action target or teacher
+labels, not more image data.
+
+#### T4. Teacher-Guided SC Insertion
+
+Goal:
+
+- carry the same framework to `SC`, with a plug-specific head if needed
+
+Gate:
+
+- randomized `SC` should first reach `50+`
+- then push to `80+`
+
+Do not mix `SC` into the mainline until `SFP` insertion is already strong.
+
+#### T5. Unified Submission Policy
+
+Goal:
+
+- integrate SFP and SC under one legal runtime policy framework
+
+Gate:
+
+- all three trials should repeatedly exceed the old legal baseline
+- at least one representative run should show the system is now insertion-led,
+  not proximity-led
+
+### Fail-Fast Conditions
+
+Abort the `center_uvz` route as the mainline if any of these remain true after
+the larger balanced dataset:
+
+- `SFP-only` still cannot beat the old SFP pair baseline
+- the model still helps acquisition but not insertion
+- the learned route still collapses once push begins
+
+Abort the teacher-guided student route if:
+
+- the offline teacher cannot itself insert reliably
+- student behavior stays at the teacher-hover level and never learns insertion
+- success depends on one fixed public-looking geometry
+
+### Immediate Next Actions For The Pivot
+
+If the current `center_uvz` rerun still fails to beat the legal baseline, do
+these next:
+
+1. build a ground-truth teacher insertion controller for randomized `SFP`
+2. collect dense successful insertion traces, not just target labels
+3. train a local insertion-frame estimator
+4. train a bounded teacher-guided insertion policy that only activates after
+   pre-insertion
+5. require `SFP >= 160 / 200` combined before starting serious `SC` work
+
+This is the first route in this repo that has a realistic path to repeated
+`80+` trial scores.
+
+### Immediate Outcome Of The First Pivot Loop
+
+The first pivot loop completed and gave a clear answer:
+
+- `center_uvz-only` failed its gate
+- the current GT teacher also failed its gate
+
+So the next PDCA cycle should not collect more student data yet. It should
+instead redesign the GT teacher so that near-contact motion is:
+
+- lower-jerk
+- axis-aware
+- explicitly recovery-capable
+- demonstrably insertion-led before any student retraining begins
