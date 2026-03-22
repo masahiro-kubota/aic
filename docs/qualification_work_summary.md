@@ -548,6 +548,147 @@ GT teacher の approach を `teacher_insert_2` まで維持してから handoff 
 の中間点探しではなく、actual advance / tracking error / contact を見ながら
 進退を切り替える progress-gated insertion へ進むべきである。
 
+### T0 v4 から T0 v14
+
+`T0 v3` 以降も、その場しのぎではなく、失敗様式の切り分けに沿って複数の
+教師 variant を試した。ここでは、それらを一つずつ列挙するより、
+「どのような方向の変更を試し、どこで頭打ちになったか」をまとめる。
+
+まずスコアの推移を高いレベルで並べるとこうなる。
+
+- `T0 v4`: `87.757801300300504 / 200`
+- `T0 v5`: `87.634212181708363 / 200`
+- `T0 v6`: `98.210481998328858 / 200`
+- `T0 v7`: `100.14674634856614 / 200`
+- `T0 v8`: `86.355029923455314 / 200`
+- `T0 v9`: `85.358903638341028 / 200`
+- `T0 v10`: `22.969587412082361 / 200`
+- `T0 v11`: `98.736565538830945 / 200`
+- `T0 v12`: `102.735714258712277 / 200`
+- `T0 v13`: `102.39539289670786 / 200`
+- `T0 v14`: `88.38253549300461 / 200`
+
+この数字だけでも、重要な事実が読み取れる。
+
+- 一連の GT teacher 再設計は、`70-100 / 200` 付近を行き来した
+- 一度も `150 / 200` の teacher gate を超えていない
+- 最良でも `T0 v12` の `102.735714258712277 / 200` であり、
+  `SFP >= 160 / 200` の中間目標にすら大きく届かない
+- したがって、現在の teacher family は「改善の余地がある未完成品」というより、
+  「このままでは本命にならない line」である可能性が高い
+
+### `T0 v4-v10` で何が分かったか
+
+`T0 v4-v10` は、大きく分けると
+「GT approach の深さと handoff の仕方をどう変えるか」
+を探るループだった。
+
+この帯で分かったことは次のとおりである。
+
+- `T0 v4` と `T0 v5` は `87` 点台で、`T0 v0/v1` と大差なかった
+- `T0 v6` と `T0 v7` は `98-100 / 200` まで伸び、少なくとも
+  `GT teacher` の近接品質は改善できることを示した
+- しかし `T0 v6/v7` でも repeated insertion success には届かなかった
+- `T0 v8` と `T0 v9` は再び `85-86 / 200` 台へ落ちた
+- `T0 v10` は tracking / force gate を早く掛けすぎて
+  `22.969587412082361 / 200` まで崩れた
+
+これらから得られる結論はかなり明確である。
+
+- 近接 controller に tracking / force gate を足すだけでは足りない
+- しかも、その gate は早すぎると簡単に run を壊す
+- 一方で、GT approach を少し深くしただけでも insertion-led にはならない
+
+つまり、`T0 v4-v10` は
+「progress gate という発想自体が無意味」と示したのではなく、
+「雑な gate 追加や handoff の深さ調整だけでは本質問題に届かない」
+ことを示した。
+
+### `T0 v11-v14` で何が分かったか
+
+`T0 v11-v14` は、より具体的に
+「いまの失敗は x/y なのか、z 進行なのか」
+を切り分けるための probe 群だった。
+
+この帯では、特に `mount_0` と `mount_4` で failure mode が違うことが
+はっきりした。
+
+#### `mount_0`
+
+`mount_0` では、`preinsert_near` の時点で x/y がすでにかなり良い run が
+複数あった。
+
+代表例として `T0 v12` の
+[02_after_gt_preinsert_near/metadata.json](/home/masa/ws_aic_runtime/qualification_debug/20260322_151651_teacher_feasibility_v12_task_1/02_after_gt_preinsert_near/metadata.json)
+では、plug の port-frame 誤差は概ね
+`x=0.00293 m`, `y=0.00036 m` だった。
+
+これは scoring 上の proximity tolerance を考えると、少なくとも
+「まだ横方向が全然合っていない」という状態ではない。
+
+それにもかかわらず、その後の depth phase では、
+[04_after_depth_insert/metadata.json](/home/masa/ws_aic_runtime/qualification_debug/20260322_151651_teacher_feasibility_v12_task_1/04_after_depth_insert/metadata.json)
+の `actual_z_progress_m` がほぼ `0` で止まっていた。
+
+`T0 v13` の dense depth phase でも同じ傾向が再現した。
+
+- x/y はある程度改善する
+- しかし depth step を刻んでも実 progress がほぼ出ない
+
+したがって `mount_0` の主問題は、
+「横方向の acquisition」よりも「正しい pre-insert からでも depth が進まない」
+ことだと判断できる。
+
+#### `mount_4`
+
+`mount_4` は逆で、`preinsert_near` に入った段階で lateral error がまだ大きい。
+
+代表例として `T0 v12` の
+[02_after_gt_preinsert_near/metadata.json](/home/masa/ws_aic_runtime/qualification_debug/20260322_152040_teacher_feasibility_v12_task_1/02_after_gt_preinsert_near/metadata.json)
+では、port-frame 誤差が概ね
+`x=0.01811 m`, `y=0.00728 m` だった。
+
+bounded xy closure を入れた
+[03_after_xy_align_bounded/metadata.json](/home/masa/ws_aic_runtime/qualification_debug/20260322_152040_teacher_feasibility_v12_task_1/03_after_xy_align_bounded/metadata.json)
+でも、改善はごく小さい。
+
+さらに `T0 v14` ではより悪い case が出ており、
+[02_after_gt_preinsert_near/metadata.json](/home/masa/ws_aic_runtime/qualification_debug/20260322_231640_teacher_feasibility_v14_task_1/02_after_gt_preinsert_near/metadata.json)
+の時点で `preinsert_xy_error_m ~= 0.05275` だった。
+
+このことは、`mount_4` については
+
+- preinsert に入る前の acquisition がまだ弱い
+- 小さな bounded xy closure では立て直せない
+
+ことを示している。
+
+#### `T0 v14` が悪化した意味
+
+`T0 v14` は `v12/v13` の知見を踏まえて、
+「lateral error が大きいときだけ GT x/y closure を強く使い、depth は単発の
+ insert に戻す」という hybrid だった。
+
+しかし結果は
+`88.38253549300461 / 200` で、`v12/v13` より明確に悪化した。
+
+この悪化が重要なのは、
+「後段の insert phase が悪かった」だけでなく、
+preinsert state 自体が不安定だと分かったからである。
+
+実際には、
+
+- `trial_1` で `mount_0` に入った時点の x 誤差が `15 mm` 級まで悪化した
+- `trial_2` では `mount_4` の y 誤差が `50 mm` 級まで崩れた
+
+つまり `v14` は、failure mode に合わせた分岐を入れたつもりでも、
+分岐前の state quality 自体を維持できなかった。
+
+これにより、いまの teacher family では
+「どこで handoff するか」
+「どこで gate するか」
+を触るだけでは上限が大きくは伸びない、と判断する材料がさらに増えた。
+
 ## 現時点の証拠が実際に示していること
 
 現時点では、いくつかの点について証拠はかなり強い。
@@ -688,6 +829,17 @@ bag metadata の例:
 | `T0 v1` | terminal contact loop 付き GT teacher | `86.562241559624113 / 200` | 意味のある改善なし |
 | `T0 v2` | GT preinsert + tool-frame force refine | `70.903064258712277 / 200` | force は改善したが shallow abort に倒れた |
 | `T0 v3` | deeper GT handoff + tool-frame force refine | `83.144378073511348 / 200` | `v2` より回復したが `v0/v1` も超えられない |
+| `T0 v4` | GT teacher probe | `87.757801300300504 / 200` | `v0/v1` 近辺まで戻したが gate には遠い |
+| `T0 v5` | GT teacher probe | `87.634212181708363 / 200` | 小幅変化のみ |
+| `T0 v6` | GT teacher probe | `98.210481998328858 / 200` | 初めて `100` 点近傍まで回復 |
+| `T0 v7` | GT teacher probe | `100.14674634856614 / 200` | `T0` 系で初の `100` 超え |
+| `T0 v8` | GT teacher probe | `86.355029923455314 / 200` | 再び後退 |
+| `T0 v9` | GT teacher probe | `85.358903638341028 / 200` | 改善継続ならず |
+| `T0 v10` | aggressive gate probe | `22.969587412082361 / 200` | tracking / force gate を早く掛けすぎて崩壊 |
+| `T0 v11` | x/y と z 切り分け probe | `98.736565538830945 / 200` | `mount_0` は x/y 良好でも z が進まないと判明 |
+| `T0 v12` | GT x/y closure + depth probe | `102.735714258712277 / 200` | 現在の GT teacher ベスト |
+| `T0 v13` | stronger x/y + dense depth probe | `102.39539289670786 / 200` | `v12` を超えられず |
+| `T0 v14` | hybrid x/y gating probe | `88.38253549300461 / 200` | preinsert state 自体が悪化して後退 |
 
 ## 現時点の判断
 
@@ -696,6 +848,13 @@ bag metadata の例:
 - `S2` を提出可能ベストの参照として維持する
 - `center_uvz-only` を本線として扱うのをやめる
 - 教師が改善するまで生徒データの増量を止める
-- 次に進む前に GT 教師を progress-gated insertion として再設計する
+- 現在の GT teacher family は `T0 v12` の `102.735714258712277 / 200` が上限で、
+  `150 / 200` gate にすら届いていない
+- したがって、`GT approach の深さ` や `handoff の位置` を少しずつ触る路線は
+  主経路としては弱い
+- 次のループでは、同じ randomized config 上でより強い upper bound を確認し、
+  必要なら teacher/controller の設計をもう一段大きく変える
+- その際の主眼は `mount_0` の depth execution と `mount_4` の lateral
+  acquisition を同じ失敗だとみなさず、別 regime として扱うことである
 
 以上が、ここまでの作業を最も正確に要約した内容である。
