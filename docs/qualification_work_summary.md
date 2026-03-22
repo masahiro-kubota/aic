@@ -104,7 +104,7 @@
 現在の状態は次のとおり。
 
 - 提出可能な構成での最高スコアは、依然として `126.58206055565613 / 300`
-- その best run は `S2` で、保存先は
+- その best run は `S2` で、実装 stage 名では `submission_safe_v6`、保存先は
   `/home/masa/aic_results/qual_submission_safe_v6_20260321_220649/scoring.yaml`
 - `SFP` は十分に強く、繰り返し 40 点台後半に着地している
 - `SC` は依然として主な bottleneck である
@@ -117,6 +117,64 @@
 - まだ生徒データを追加収集しない
 - まず教師/controller を再設計する
 - 教師自身が挿入主導になるまで、教師誘導の生徒学習は再開しない
+
+## 現在のベスト run `S2` は何をしているか
+
+現在のベストスコアは、「全部を end-to-end に学習した policy」ではない。
+`submission_safe_v6` という stage 名の、手設計制御と学習ベース局所化を組み合わせた hybrid pipeline である。
+
+まず前提として、この run は提出可能な制約を守っている。
+
+- runtime では official な `Task` と `Observation` だけを使う
+- `_DEV_TARGETS`、public-sample world target、`/scoring/*` のような backend
+  情報には依存しない
+- 同じ policy が `SFP` trial と `SC` trial の両方を処理する
+
+そのうえで、処理は plug type ごとに branch している。
+
+### `SFP` 側でやっていること
+
+`SFP` 側は、学習モデルではなく、中心 camera の現在画像から作る手設計の
+legal servo が本体である。
+
+- center camera の画像から port まわりの image-space feature を取る
+- その feature の中心が画像中心へ来るように、TCP を小刻みに平行移動させる
+- feature の見かけサイズが目標値に近づくように、奥行き方向も合わせる
+- 向きは大きく学習で補正せず、最後は現在の TCP 向きに基づく短い
+  tool-axis push を 1 回だけ入れる
+
+つまり `SFP` の 40 点台後半は、「手設計の center-camera visual servo で
+port 入口近傍まで寄せ、短い軸方向 push を入れる」ことで出ている。
+
+### `SC` 側でやっていること
+
+`SC` 側が `S1` から `S2` へ伸びた主因であり、ここだけが明確に learned
+acquisition に置き換わっている。
+
+- 入力は left / center / right wrist camera 画像、center camera の内部
+  パラメータ、現在の TCP pose や観測要約から作る runtime auxiliary vector
+- 学習モデルは target port の `center_uvz` を推定する
+- ただし実装上は、center camera で信頼できる cyan centroid が見えている
+  ときは、その `uv` は生の観測値を優先し、主に depth 側を学習値で補う
+- 制御は translation-only で、姿勢を大きく振らずに coarse-to-fine で寄せる
+- 具体的には `hover -> insert_mid -> insert_final` の 3 段階 template に
+  向けて、観測更新を挟みながら平行移動サーボを繰り返す
+- その後に短い `SC` 軸方向 push を入れて、近接スコアを取りに行く
+
+要するに `S2` の本質は、「`SFP` は既存の安定した手設計 servo を維持し、
+`SC` だけを learned multi-view pre-insertion alignment に差し替えた」点にある。
+
+### 何がまだできていないか
+
+この best run は、良い pre-insertion alignment を作るところまでは前進しているが、
+挿入主導の controller にはなっていない。
+
+- `SFP` は多くの場合 `Tier 3 ~= 24-25` で、入口近傍止まり
+- `SC` は `S1` よりは改善したが、まだ `Tier 3 = 6.73` で、近傍までの詰めも
+  足りない
+- したがって、現在の best score は「優れた insertion algorithm」で取れて
+  いるのではなく、「提出可能な pre-insertion alignment の best 版」で
+  取れている
 
 ## 重要な運用上の事実
 
@@ -258,7 +316,7 @@ acquisition を改善した。
 
 これにより、legal framework 自体が問題ではないことが明確になった。
 
-### S2: learned `SC` acquisition
+### S2: `submission_safe_v6` による learned `SC` acquisition
 
 `S2` は、現在の提出可能ベスト結果になった。
 
@@ -267,6 +325,16 @@ acquisition を改善した。
   - `t1=48.21030515038397`
   - `t2=48.982548911699574`
   - `t3=29.389206493572582`
+
+`S2` が実際に使っているアルゴリズムは次のとおり。
+
+- stage 名は `submission_safe_v6`
+- `SFP` は手設計の center-camera visual servo と短い tool-axis push
+- `SC` は learned multi-view `center_uvz` 推定に基づく coarse-to-fine の
+  translation-only servo と短い tool-axis push
+- つまりこれは「全面 learned policy」ではなく、安定していた legal `SFP`
+  path を残したまま、`SC` の pre-insertion alignment だけを learned 化した
+  hybrid pipeline である
 
 `S2` が示したこと:
 
