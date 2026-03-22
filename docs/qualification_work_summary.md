@@ -1,391 +1,385 @@
-# Qualification Work Summary
+# 予選フェーズ作業サマリ
 
-## Purpose
+## 目的
 
-This document summarizes the qualification-phase work so far at a higher level
-than the detailed experiment log.
+この文書は、詳細な実験ログよりも一段高いレベルで、これまでの予選フェーズ作業を要約する。
 
-The goal of this summary is to make it easy to answer the following questions:
+このサマリの目的は、次の問いに答えやすくすることにある。
 
-- what has been tried so far
-- which runs improved the score and which did not
-- what conclusions were actually supported by experiments
-- what the current blocker is
-- what should happen next
+- これまで何を試してきたか
+- どの run がスコア改善につながり、どれがつながらなかったか
+- 実験で実際に裏づけられた結論は何か
+- 現在の blocker は何か
+- 次に何をすべきか
 
-This file is intentionally redundant with
+このファイルは、意図的に
 [qualification_experiment_log.md](/home/masa/ws_aic/src/aic/docs/qualification_experiment_log.md)
-and
-[qualification_strategy_notes.md](/home/masa/ws_aic/src/aic/docs/qualification_strategy_notes.md).
-The experiment log is the raw chronological record. The strategy notes are the
-design and planning document. This file is the narrative bridge between them.
+および
+[qualification_strategy_notes.md](/home/masa/ws_aic/src/aic/docs/qualification_strategy_notes.md)
+と内容を重ねている。実験ログは生の時系列記録であり、strategy notes は設計と計画の文書である。このファイルは、その両者をつなぐ叙述的な橋渡しである。
 
-## Current Bottom Line
+## 現時点の結論
 
-The current state is:
+現在の状態は次のとおり。
 
-- the best submission-safe score is still `126.58206055565613 / 300`
-- that best run is `S2`, stored at
+- 提出可能な構成での最高スコアは、依然として `126.58206055565613 / 300`
+- その best run は `S2` で、保存先は
   `/home/masa/aic_results/qual_submission_safe_v6_20260321_220649/scoring.yaml`
-- `SFP` is reasonably strong and repeatedly lands in the high-40-point band
-- `SC` is still the main bottleneck
-- `center_uvz-only` has now failed as the mainline strategy
-- the first ground-truth teacher feasibility loop also failed its gate
+- `SFP` は十分に強く、繰り返し 40 点台後半に着地している
+- `SC` は依然として主な bottleneck である
+- `center_uvz-only` は本線戦略としては失敗したと判断している
+- 最初の ground-truth 教師実現性ループもゲートを通過できなかった
 
-The current project conclusion is therefore:
+したがって、現時点でのプロジェクト結論は次のとおり。
 
-- do not keep tuning `center_uvz-only`
-- do not collect more student data yet
-- redesign the teacher/controller first
-- only resume teacher-guided student learning after the teacher itself becomes
-  insertion-led
+- `center_uvz-only` の調整は続けない
+- まだ生徒データを追加収集しない
+- まず教師/controller を再設計する
+- 教師自身が挿入主導になるまで、教師誘導の生徒学習は再開しない
 
-## Important Operational Facts
+## 重要な運用上の事実
 
-The following environment facts turned out to matter in practice:
+実運用では、次の環境上の事実が重要だと分かった。
 
-- GUI-capable runs should explicitly set `DISPLAY=:1`
-- changing packages under `src/aic` requires rebuilding before validating
-- `distrobox enter -r aic_eval` was awkward in this environment because it
-  internally tried to use interactive `sudo`
-- `docker exec` was a workable replacement, and the docs were adjusted in that
-  direction
+- GUI を使う実行では、明示的に `DISPLAY=:1` を設定するべき
+- `src/aic` 配下の package を変更した場合、検証前に rebuild が必要
+- `distrobox enter -r aic_eval` は、この環境では内部で対話式の `sudo`
+  を使おうとするため扱いにくかった
+- `docker exec` は実用的な代替手段であり、ドキュメントもその方向へ
+  修正した
 
-These are also reflected in local workflow notes and docs updates.
+これらはローカルの workflow メモや docs 更新にも反映済みである。
 
-## What Was Verified Early
+## 初期に確認されたこと
 
-Before serious policy iteration, several environment and scoring issues were
-checked:
+本格的な policy 反復に入る前に、いくつかの環境・scoring 問題を確認した。
 
-1. The end-to-end pipeline from docs could run.
-2. GUI launch via `DISPLAY=:1` worked.
-3. The earlier `Tier 3 tf between cable and port not found` issue was traced to
-   stale evaluation artifacts rather than only to source state.
-4. Rebuilding the relevant packages in the evaluation path was necessary for
-   some upstream fixes to actually take effect.
+1. docs に書かれた end-to-end pipeline を実行できた。
+2. `DISPLAY=:1` による GUI 起動が機能した。
+3. 以前の `Tier 3 tf between cable and port not found` 問題は、source state
+   だけでなく古い evaluation artifact にも起因していると分かった。
+4. 一部の upstream fix を実際に反映させるには、evaluation path 側で関連
+   package を rebuild する必要があった。
 
-This mattered because it separated environment problems from actual policy
-performance problems.
+これが重要だったのは、環境問題と実際の policy 性能問題を切り分けられたからである。
 
-## Scoring Reality
+## スコアの現実
 
-One important clarification that shaped the later plan:
+後続の計画に大きく影響した重要な確認事項がある。
 
-- scoring is `100` per trial, not `100` total
-- qualification sample runs discussed here usually have `3` trials, so the
-  meaningful total scale is `300`
-- a score around `120` is therefore not "pretty good"; it is still far from the
-  `80+` per-trial regime needed for a serious submission
+- スコアは合計 `100` ではなく、trial ごとに `100`
+- ここで扱う qualification sample run は通常 `3` trial なので、意味のある
+  総スケールは `300`
+- したがって `120` 前後は「かなり良い」ではなく、本気の提出に必要な
+  trial あたり `80+` の水準にはまだ遠い
 
-That realization is what pushed the work away from "small improvements" and
-toward "cross the insertion cliff".
+この認識が、作業の重心を「小さな改善」から「挿入の崖を越える」方向へ移した。
 
-## High-Level Timeline
+## 全体タイムライン
 
-The work naturally split into several phases:
+作業は自然にいくつかのフェーズに分かれた。
 
-1. Public-sample experimentation and development scaffolding
-2. First submission-safe baseline
-3. Better legal `SC` acquisition
-4. Learned acquisition experiments
-5. Pivot planning after `center_uvz` stagnation
-6. First teacher-feasibility experiments
+1. `public-sample` 実験と開発基盤の整備
+2. 最初の提出可能ベースライン
+3. より良い legal `SC` acquisition
+4. 学習ベースの acquisition 実験
+5. `center_uvz` 停滞後のピボット計画
+6. 最初の教師実現性実験
 
-Each phase is described below.
+以下で各フェーズを説明する。
 
-## Phase 1: Public-Sample And Development Scaffolding
+## フェーズ1: `public-sample` 実験と開発基盤の整備
 
-### Public-sample replay reference
+### `public-sample` リプレイ参照
 
-Early on, a strong public-sample-oriented replay policy was built as a reference.
+初期には、参照用として強い `public-sample` 指向の replay policy を構築した。
 
 - Score: `202.68080794003197`
-- This was useful as an upper reference for "what a tuned public-sample-specific
-  policy can do locally"
-- This was not considered submission-safe
+- これは「`public-sample` 特化 policy をローカルで十分に詰めるとどこまで
+  出せるか」の上限参照として有用だった
+- これは提出可能な構成とは見なしていない
 
-The key value of this phase was not the submission value of the score, but the
-fact that it showed the environment was capable of much higher local scores
-than the initial legal baselines.
+このフェーズの価値は、スコア自体の提出価値ではなく、初期の legal baseline
+よりはるかに高いローカルスコアを環境側が出せることを示した点にあった。
 
-### M0 through M7
+### M0 から M7
 
-The `M0-M7` sequence was the development-oriented milestone ladder.
+`M0-M7` の並びは、開発指向の milestone ladder だった。
 
-The main point of `M0-M7` was to build observability and to test ideas in a
-controlled way before insisting on submission safety.
+`M0-M7` の主眼は、提出可能性に厳密にこだわる前に、可観測性を整備し、
+制御された形でアイデアを検証することだった。
 
-Representative scores:
+代表的なスコアは以下のとおり。
 
-| Milestone | Purpose | Score |
+| マイルストーン | 目的 | スコア |
 | --- | --- | ---: |
-| `M0` | observability harness | `3` |
-| `M1` | development target controller harness | `100.11421244878404` |
-| `M2` | first SFP center-camera localizer | `3` |
-| `M3` | first task-conditioned SFP template tuning | `-21` |
-| `M4` | public-sample full pipeline baseline | `93.084972039114518` |
+| `M0` | 可観測性ハーネス | `3` |
+| `M1` | 開発用 target controller ハーネス | `100.11421244878404` |
+| `M2` | 最初の `SFP` center-camera localizer | `3` |
+| `M3` | 最初の task-conditioned `SFP` template tuning | `-21` |
+| `M4` | `public-sample` full pipeline baseline | `93.084972039114518` |
 | `M5` | multi-camera late fusion | `109.96488164803876` |
-| `M6` | SC force-guided refinement | `110.0571545895495` |
-| `M7` | residual refinement with fresh-observation gating | `111.43384153152546` |
+| `M6` | `SC` force-guided refinement | `110.0571545895495` |
+| `M7` | fresh-observation gating 付き residual refinement | `111.43384153152546` |
 
-Main takeaways from `M0-M7`:
+`M0-M7` から得られた主な知見は次のとおり。
 
-- observability and debug artifacts were worth the effort
-- stale observation handling and sim-time pacing mattered
-- `SFP` could be pushed up fairly reliably
-- `SC` kept resisting insertion
-- development-only paths were useful for diagnosis but not for final policy
+- 可観測性と debug artifact への投資は価値があった
+- 古い observation の扱いと sim-time pacing が重要だった
+- `SFP` はかなり安定して押し上げられた
+- `SC` は依然として挿入を拒み続けた
+- 開発専用の path は診断には有用だったが、最終 policy には使えなかった
 
-The final conclusion of this phase was that development scaffolding was useful,
-but the project still needed a real submission-safe track.
+このフェーズの最終結論は、開発用足場は有用だったが、プロジェクトには依然として本物の提出可能トラックが必要だということだった。
 
-## Phase 2: First Submission-Safe Baselines
+## フェーズ2: 最初の提出可能ベースライン
 
-### S0: first legal-only end-to-end run
+### S0: 最初の `legal-only` end-to-end run
 
-`S0` was the first run treated as a real submission-safe baseline.
+`S0` は、初めて実際の提出可能 baseline として扱われた run だった。
 
 - Score: `98.041744964269498`
-- By trial:
+- trial ごと:
   - `t1=48.061318260132214`
   - `t2=48.980426704591785`
   - `t3=1.0`
 
-What `S0` proved:
+`S0` が示したこと:
 
-- it was possible to complete all 3 trials using only legal runtime inputs
-- the legal `SFP` path was already fairly stable
-- `SC` was clearly the weak point
+- 許可された実行時入力だけで 3 trial すべてを完了できる
+- legal な `SFP` path はすでにかなり安定している
+- `SC` が明確な弱点である
 
-This was the first major turning point. The problem was no longer "can we build
-a legal pipeline?" but "why does legal `SC` acquisition still fail so badly?"
+これは最初の大きな転換点だった。問題はもはや「legal pipeline を作れるか」
+ではなく、「なぜ legal な `SC` acquisition はここまでひどく失敗するのか」
+になった。
 
-### S1: triangulated SC translation-only acquisition
+### S1: triangulated `SC` translation-only acquisition
 
-`S1` improved legal `SC` acquisition with a triangulated translation-only stage.
+`S1` では、三角測量ベースの translation-only stage により、legal な `SC`
+acquisition を改善した。
 
 - Score: `122.08548930859087`
-- By trial:
+- trial ごと:
   - `t1=48.72334879624358`
   - `t2=48.987096754294114`
   - `t3=24.375043758053183`
 
-What `S1` proved:
+`S1` が示したこと:
 
-- legal `SC` acquisition could contribute meaningful score
-- some earlier `SC` orientation heuristics were making things worse
-- even without insertion, better legal acquisition could move `SC` far beyond
-  Tier 1 only
+- legal な `SC` acquisition でも意味のあるスコア増分を出せる
+- 以前の `SC` orientation heuristic の一部は、かえって悪化要因だった
+- 挿入に至らなくても、より良い legal acquisition によって `SC` を
+  Tier 1 only よりかなり先へ進められる
 
-This established that the legal framework itself was not the problem.
+これにより、legal framework 自体が問題ではないことが明確になった。
 
-### S2: learned SC acquisition
+### S2: learned `SC` acquisition
 
-`S2` became the current best submission-safe result.
+`S2` は、現在の提出可能ベスト結果になった。
 
 - Score: `126.58206055565613`
-- By trial:
+- trial ごと:
   - `t1=48.21030515038397`
   - `t2=48.982548911699574`
   - `t3=29.389206493572582`
 
-What `S2` proved:
+`S2` が示したこと:
 
-- learned legal `SC` acquisition can beat the best hand-crafted legal version
-- the legal path is not stuck at `~100`
-- but the whole system is still proximity-led rather than insertion-led
+- 学習ベースの legal `SC` acquisition は、最良の hand-crafted legal version
+  を上回れる
+- legal path は `~100` に張り付いているわけではない
+- ただし、システム全体は依然として挿入主導ではなく近接主導である
 
-This is the current official best submission-safe reference.
+これが現在の公式な提出可能ベスト参照である。
 
-## Phase 3: Small Legal Follow-Ups That Did Not Change The Main Picture
+## フェーズ3: 全体像を変えなかった小規模な legal 追試
 
-### X1: tool-frame force search probe
+### X1: `tool-frame` force search probe
 
-An isolated `SC` tool-frame force search was tested.
+分離した `SC` の `tool-frame` force search を試した。
 
-- Score: `33.404680405165706` on the isolated probe
+- Score: 分離 probe 上で `33.404680405165706`
 
-What it showed:
+ここから分かったこと:
 
-- the force search idea was not useless
-- but it was too slow and too brittle to promote immediately
-- it did not justify replacing `S2`
+- force search という発想自体は無意味ではない
+- ただし、すぐに本線へ昇格させるには遅すぎ、壊れやすすぎる
+- `S2` を置き換える根拠にはならなかった
 
-The lesson here was that local force search alone was not the missing piece.
+ここでの教訓は、局所的な force search だけでは欠けているピースにならない、
+ということだった。
 
-## Phase 4: `center_uvz` Learned SFP Route
+## フェーズ4: `center_uvz` 学習ベース `SFP` ルート
 
-After the legal `SC` acquisition work, the next large branch focused on learned
-`SFP` acquisition, particularly a `center_uvz` target representation.
+legal `SC` acquisition の作業の後、次の大きな分岐は、学習ベースの `SFP`
+acquisition、特に `center_uvz` target representation に集中した。
 
-### Data collection
+### データ収集
 
-A larger randomized `SFP` dataset was collected:
+より大きなランダム化 `SFP` dataset を収集した。
 
-- `20` randomized trials
-- `840` total samples
-- balanced across all five `SFP` rails
-- phases included initial, teacher hover, and teacher insert sweeps
+- `20` randomized trial
+- `840` 総サンプル
+- 5 本の `SFP` rail すべてでバランスを取った
+- phase には initial、teacher hover、teacher insert sweep を含めた
 
-This was meant to test whether `center_uvz` could become a serious legal
-mainline.
+これは、`center_uvz` が本当に legal な本線になりうるかを試すためだった。
 
-### Training
+### 訓練
 
-A larger `center_uvz` model was trained on that dataset.
+その dataset で、より大きな `center_uvz` model を訓練した。
 
-- training ran to `160` epochs
-- best checkpoint was at `epoch 152`
-- best validation loss was `0.006016482987130682`
-- best validation metrics were in the rough range of:
+- training は `160` epoch まで実行
+- best checkpoint は `epoch 152`
+- best validation loss は `0.006016482987130682`
+- best validation metrics は概ね次の範囲だった
   - `u ~= 4.18 px`
   - `v ~= 11.59 px`
   - `depth ~= 2.42 mm`
 
-This was a nontrivial improvement on paper.
+紙の上では、これは無視できない改善だった。
 
-### Runtime bug and fix
+### 実行時バグと修正
 
-An important runtime bug was found:
+重要な runtime bug が見つかった。
 
-- the learned model expected runtime auxiliary features
-- runtime inference was not actually feeding them
-- this caused nonsense predictions or no motion
+- 学習済み model は runtime auxiliary feature を期待していた
+- しかし runtime inference では、それが実際には入力されていなかった
+- そのため、無意味な予測、あるいはまったく動かない挙動が起きていた
 
-That bug was fixed, and the learned branch was re-evaluated.
+この bug を修正し、学習 branch を再評価した。
 
-### P0 gate result
+### P0 ゲート結果
 
-Even after retraining and the runtime bugfix, the larger `center_uvz` route
-failed the mainline gate:
+再訓練と runtime bugfix の後でも、より大きな `center_uvz` ルートは本線
+ゲートを通過できなかった。
 
 - Score: `71.320068644735088 / 200` on `SFP-only`
-- By trial:
+- trial ごと:
   - `t1=35.220362710871615`
   - `t2=36.099705933863473`
 
-Why this mattered:
+これが重要だった理由:
 
-- this was well below the older `SFP` pair baseline from `S2`
-- the model improved acquisition enough to move, but not enough to cross into
-  insertion-driven scoring
-- this is why `center_uvz-only` is now considered failed as the mainline route
+- これは `S2` の旧 `SFP` pair baseline よりかなり低い
+- model は動ける程度には acquisition を改善したが、挿入主導の scoring に
+  入るには足りなかった
+- そのため、`center_uvz-only` は本線ルートとして失敗と見なしている
 
-This was the second major turning point.
+これは 2 回目の大きな転換点だった。
 
-## Phase 5: Pivot To Teacher-Guided Insertion
+## フェーズ5: 教師誘導による挿入へのピボット
 
-Once `center_uvz-only` failed, the strategy pivoted away from "predict a point
-better" and toward "make insertion itself learnable".
+`center_uvz-only` が失敗した後、戦略は「点をよりうまく予測する」ことから
+離れ、「挿入そのものを学習可能にする」方向へピボットした。
 
-The core pivot idea was:
+このピボットの核となる考え方は次のとおり。
 
-- use learning to estimate a local insertion frame
-- then use a teacher-guided near-contact policy in that frame
+- 学習で局所的な挿入フレームを推定する
+- そのフレーム内で、教師誘導の近接接触 policy を使う
 
-The important conceptual shift was:
+ここで重要だった概念上の転換は次のとおり。
 
-- the problem is not only acquisition
-- the real bottleneck is crossing from proximity to insertion
+- 問題は acquisition だけではない
+- 真の bottleneck は、近接から挿入へ移ることにある
 
-This pivot was written explicitly into
+このピボットは、
 [qualification_strategy_notes.md](/home/masa/ws_aic/src/aic/docs/qualification_strategy_notes.md)
-under the `Pivot Plan If center_uvz Stalls` section.
+の `Pivot Plan If center_uvz Stalls` セクションに明示的に書き込んである。
 
-## Phase 6: First Teacher Feasibility Loop
+## フェーズ6: 最初の教師実現性ループ
 
-The pivot plan started with `T0`: before training a student, check whether a
-ground-truth teacher can itself score well enough on randomized `SFP`.
+ピボット計画は `T0` から始めた。生徒を訓練する前に、ground-truth 教師
+そのものが randomized `SFP` で十分なスコアを出せるか確認するためである。
 
-This was deliberate. If the teacher cannot insert reliably, collecting more
-student labels is premature.
+これは意図的な順序だった。教師が安定して挿入できないなら、生徒ラベルを
+さらに集めるのは時期尚早である。
 
 ### T0 v0
 
-The first GT teacher feasibility run used a randomized `SFP-only` config.
+最初の GT 教師実現性 run では、randomized `SFP-only` config を使った。
 
 - Score: `86.653740214899685 / 200`
-- By trial:
+- trial ごと:
   - `t1=41.779318087841951`
   - `t2=44.874422127057734`
 
-What this showed:
+ここから分かったこと:
 
-- the teacher could complete both tasks
-- the teacher could get very near the mouth of the port
-- but it still did not produce insertion events
+- 教師は両方の task を完了できた
+- port の口元近くまでは到達できた
+- しかし挿入イベントは起こせなかった
 
-So even with GT, the controller was still proximity-led.
+つまり GT を使っても、controller は依然として近接主導だった。
 
 ### T0 v1
 
-A second teacher feasibility run added a GT terminal-contact loop before the
-final push.
+2 回目の教師実現性 run では、最終 push の前に GT terminal-contact loop を
+追加した。
 
 - Score: `86.562241559624113 / 200`
-- By trial:
+- trial ごと:
   - `t1=42.659702234323316`
   - `t2=43.902539325300786`
 
-This was effectively unchanged from `T0 v0`.
+これは実質的に `T0 v0` と変わらなかった。
 
-What this means:
+これが意味すること:
 
-- replacing the last fixed push with a slightly more GT-aware loop did not
-  change the result enough
-- the problem is not solved by a tiny local patch
-- the teacher itself still needs a more fundamental redesign
+- 最後の固定 push を少し GT-aware な loop に置き換えても、結果は十分には
+  変わらなかった
+- 問題は小さな局所パッチでは解決しない
+- 教師自体に、より根本的な再設計が必要である
 
-This was the third major turning point.
+これは 3 回目の大きな転換点だった。
 
-## What The Current Evidence Actually Says
+## 現時点の証拠が実際に示していること
 
-At this point, the evidence is fairly strong on several points.
+現時点では、いくつかの点について証拠はかなり強い。
 
-### 1. Legal runtime inputs are not the limiting factor
+### 1. Legal runtime input は制約要因ではない
 
-`S0`, `S1`, and `S2` proved that legal runtime inputs can support nontrivial
-performance.
+`S0`、`S1`、`S2` は、legal runtime input だけでも無視できない性能が出せる
+ことを示した。
 
-### 2. `SFP` is not solved, but it is not the worst part
+### 2. `SFP` は未解決だが、最悪の部分ではない
 
-Repeated legal runs keep `SFP` around the high-40-point band. That is not good
-enough, but it is materially stronger than the current `SC` path.
+legal run を繰り返しても、`SFP` はおおむね 40 点台後半を維持している。
+これは十分ではないが、現在の `SC` path よりは明らかに強い。
 
-### 3. `SC` is still the main blocker on the submission-safe path
+### 3. `SC` は提出可能 path における主 blocker のままである
 
-The best legal total is still capped by `SC` not reaching insertion.
+legal な total の best は、依然として `SC` が挿入に届かないことにより頭打ちになっている。
 
-### 4. `center_uvz-only` is not the right mainline
+### 4. `center_uvz-only` は正しい本線ではない
 
-Even with better data and a fixed runtime bug, it failed the `SFP-only` gate.
+より良いデータと runtime bug 修正があっても、`SFP-only` ゲートを通過できなかった。
 
-### 5. The current GT teacher is also not good enough
+### 5. 現在の GT 教師も十分ではない
 
-This is the most important recent conclusion.
+これが最近の結論として最も重要である。
 
-The current GT teacher:
+現在の GT 教師は:
 
-- reaches near-contact
-- completes tasks
-- but does not insert
+- 近接接触までは到達する
+- task は完了する
+- しかし挿入しない
 
-That means the next bottleneck is teacher/controller design, not student model
-capacity.
+つまり、次の bottleneck は生徒 model の容量ではなく、教師/controller 設計である。
 
-## What Has Been Inspected And What Still Needs More Work
+## 何を確認済みで、何にまだ追加作業が必要か
 
-### What has already been inspected
+### すでに確認したもの
 
-The work so far has used:
+ここまでの作業では、次を使って確認してきた。
 
-- scoring outputs
-- debug snapshots under `/home/masa/ws_aic_runtime/qualification_debug`
-- per-run logs
-- bag existence and bag metadata
+- scoring output
+- `/home/masa/ws_aic_runtime/qualification_debug` 配下の debug snapshot
+- 各 run の log
+- bag の有無と bag metadata
 
-For the latest `T0` runs, bag metadata confirms the presence of useful signals:
+最新の `T0` run については、bag metadata から有用な signal が存在することも確認できている。
 
 - `/aic_controller/pose_commands`
 - `/aic_controller/controller_state`
@@ -393,7 +387,7 @@ For the latest `T0` runs, bag metadata confirms the presence of useful signals:
 - `/tf`
 - `/scoring/tf`
 
-Example bag metadata:
+bag metadata の例:
 
 - `trial_1` bag duration: `60.869616868 s`
 - `trial_1` pose commands: `213`
@@ -404,94 +398,88 @@ Example bag metadata:
 - `trial_2` controller_state messages: `2215`
 - `trial_2` wrench messages: `222`
 
-### What still needs deeper work
+### まだより深い作業が必要な点
 
-The next loop should be more explicitly bag-first than some of the recent
-iterations.
+次のループでは、最近のいくつかの反復よりも、より明確に bag-first で進めるべきである。
 
-In particular, the next controller redesign should be based on:
+特に、次の controller 再設計は以下に基づくべきである。
 
-- the actual relationship between pose commands and realized motion near contact
-- where the wrench rises and whether that rise corresponds to useful insertion
-  or useless collision
-- whether the end-effector advances along the intended insertion axis after
-  contact
-- whether the final teacher phases are too jerky or too misaligned
+- 近接接触付近での pose command と実際の動きの関係
+- `wrench` がどこで立ち上がり、その立ち上がりが有効な挿入に対応しているのか、
+  それとも無意味な衝突に対応しているのか
+- contact 後に end-effector が意図した挿入軸に沿って前進しているか
+- 最終の教師 phase がジャーク過多ではないか、あるいはアライメントがずれて
+  いないか
 
-This is a real next-step requirement, not a vague "maybe inspect later".
+これは「あとで気が向いたら見よう」という話ではなく、明確な次ステップ要件である。
 
-## Why More Student Data Is Not The Immediate Answer
+## なぜ今すぐ生徒データを増やすべきではないのか
 
-It would be easy to keep collecting more training data because the infrastructure
-for it already exists. That is not the current priority.
+データ収集の infrastructure はすでにあるため、学習データを増やし続けること自体は簡単である。しかし、それは現時点の優先事項ではない。
 
-The current reasoning is:
+現在の判断根拠は次のとおり。
 
-1. `center_uvz-only` already received a serious data increase and still failed
-   its gate.
-2. The GT teacher also failed its own gate.
-3. Therefore, collecting more student labels right now is unlikely to address
-   the real bottleneck.
+1. `center_uvz-only` はすでに大幅なデータ増強を受けたにもかかわらず、ゲートに失敗した。
+2. GT 教師も自身のゲートに失敗した。
+3. したがって、今すぐ生徒ラベルをさらに集めても、真の bottleneck 解消にはつながりにくい。
 
-So the current data policy is:
+そのため、現在のデータ方針は次のとおり。
 
-- do not prioritize more point-label acquisition right now
-- only resume large student-data collection after the GT teacher becomes
-  insertion-led
-- once that happens, collect dense teacher-guided insertion traces rather than
-  only sparse target labels
+- 今は point-label acquisition の追加を優先しない
+- GT 教師が挿入主導になるまで、大規模な生徒データ収集は再開しない
+- それが実現したら、疎な target label だけでなく、高密度な教師誘導 insertion trace を収集する
 
-## What The Next PDCA Loop Should Focus On
+## 次の PDCA ループで重視すべきこと
 
-The next loop should not be "try another small tweak".
+次のループは、「また小さな tweak を試す」ではない。
 
-It should be:
+次にやるべきことは以下である。
 
-1. analyze the latest `T0` bags and debug artifacts at the near-contact phase
-2. redesign the GT teacher to be:
-   - lower-jerk
-   - axis-aware
-   - recovery-capable
-   - explicitly insertion-oriented
-3. rerun randomized `SFP-only` teacher feasibility
-4. require `>= 150 / 200` before resuming teacher-guided student work
+1. 最新の `T0` bag と debug artifact を、近接接触 phase に注目して解析する
+2. GT 教師を次の性質を持つよう再設計する
+   - 低ジャーク
+   - 軸を意識している
+   - リカバリ可能である
+   - 明示的に挿入指向である
+3. randomized `SFP-only` で教師実現性を再実行する
+4. 教師誘導の生徒作業を再開する前提として `>= 150 / 200` を要求する
 
-Only after that gate is passed should the project move to:
+このゲートを通過して初めて、プロジェクトは次へ進むべきである。
 
-- dense successful teacher insertion data collection
-- local insertion-frame student learning
-- bounded teacher-guided insertion policy training
+- 成功した教師挿入データの高密度収集
+- 局所挿入フレームの生徒学習
+- 制約付きの教師誘導挿入 policy 訓練
 
-## Score Table
+## スコア表
 
-The following table is the most useful high-level score summary so far.
+以下の表が、ここまでで最も有用な高レベルのスコア要約である。
 
-| Label | Meaning | Score | Notes |
+| ラベル | 意味 | スコア | 補足 |
 | --- | --- | ---: | --- |
-| public replay ref | public-sample-oriented reference | `202.68080794003197` | not submission-safe |
-| `M0` | observability harness | `3` | debug-first scaffold |
-| `M1` | dev target controller harness | `100.11421244878404` | development-only |
-| `M2` | first SFP center localizer | `3` | no useful execution yet |
-| `M3` | first task-conditioned SFP tuning | `-21` | regressed badly |
-| `M4` | public-sample full-pipeline baseline | `93.084972039114518` | still development-oriented |
-| `M5` | multi-camera late fusion | `109.96488164803876` | better, still dev-oriented |
-| `M6` | SC force-guided refine | `110.0571545895495` | minimal gain |
-| `M7` | residual refine with fresh observation gating | `111.43384153152546` | still not submission-safe |
-| `S0` | first submission-safe baseline | `98.041744964269498` | legal-only pipeline exists |
-| `S1` | triangulated legal SC acquisition | `122.08548930859087` | big legal improvement |
-| `S2` | learned legal SC acquisition | `126.58206055565613` | current best submission-safe |
-| `X1` | legal SC force-search probe | `33.404680405165706` | isolated SC probe |
-| `P0` | larger balanced `center_uvz` gate | `71.320068644735088 / 200` | failed `SFP-only` mainline gate |
-| `T0 v0` | randomized GT teacher feasibility | `86.653740214899685 / 200` | GT teacher still not insertion-led |
-| `T0 v1` | GT teacher with terminal contact loop | `86.562241559624113 / 200` | no meaningful improvement |
+| public replay ref | `public-sample` 指向の参照 | `202.68080794003197` | 提出可能ではない |
+| `M0` | 可観測性ハーネス | `3` | debug-first の足場 |
+| `M1` | 開発用 target controller ハーネス | `100.11421244878404` | 開発専用 |
+| `M2` | 最初の `SFP` center localizer | `3` | まだ有効な実行なし |
+| `M3` | 最初の task-conditioned `SFP` tuning | `-21` | 大きく悪化 |
+| `M4` | `public-sample` full-pipeline baseline | `93.084972039114518` | なお開発寄り |
+| `M5` | multi-camera late fusion | `109.96488164803876` | 改善したがまだ開発寄り |
+| `M6` | `SC` force-guided refinement | `110.0571545895495` | 改善は最小 |
+| `M7` | fresh observation gating 付き residual refine | `111.43384153152546` | なお提出可能ではない |
+| `S0` | 最初の提出可能 baseline | `98.041744964269498` | `legal-only` pipeline の存在を確認 |
+| `S1` | triangulated legal `SC` acquisition | `122.08548930859087` | 大きな legal 改善 |
+| `S2` | learned legal `SC` acquisition | `126.58206055565613` | 現在の提出可能ベスト |
+| `X1` | legal `SC` force-search probe | `33.404680405165706` | 分離した `SC` probe |
+| `P0` | より大きくバランスした `center_uvz` ゲート | `71.320068644735088 / 200` | `SFP-only` 本線ゲート失敗 |
+| `T0 v0` | randomized GT teacher feasibility | `86.653740214899685 / 200` | GT teacher はまだ挿入主導ではない |
+| `T0 v1` | terminal contact loop 付き GT teacher | `86.562241559624113 / 200` | 意味のある改善なし |
 
-## Current Decision
+## 現時点の判断
 
-The current decision is:
+現時点の判断は次のとおり。
 
-- keep `S2` as the best submission-safe reference
-- stop treating `center_uvz-only` as the mainline
-- stop increasing student data until the teacher improves
-- redesign the GT teacher before moving on
+- `S2` を提出可能ベストの参照として維持する
+- `center_uvz-only` を本線として扱うのをやめる
+- 教師が改善するまで生徒データの増量を止める
+- 次に進む前に GT 教師を再設計する
 
-That is the most accurate summary of the work so far.
+以上が、ここまでの作業を最も正確に要約した内容である。
