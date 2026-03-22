@@ -7,6 +7,12 @@ Welcome to the **AI for Industry Challenge**. This document outlines the technic
 > [!IMPORTANT]
 > To complete the registry upload, you must have the credentials provided in your **onboarding email** sent to team leaders. These include your unique AWS access credentials, and the ECR Repository URI assigned to your team.
 
+> [!NOTE]
+> For the repo-specific daily operating procedure we use locally, including
+> branch freezing, artifact vendoring, local re-verification, and submission
+> logging, see
+> [Daily Submission Workflow](./daily_submission_workflow.md).
+
 ---
 
 ## 1. Prepare and Build Your Image
