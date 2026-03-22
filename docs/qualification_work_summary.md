@@ -512,6 +512,42 @@ acquisition、特に `center_uvz` target representation に集中した。
 「GT でより良い pre-insertion まで維持しつつ、stall / tracking error を見て
 progress-gated に recovery する insertion phase」である。
 
+### T0 v3
+
+その次の run では、`T0 v2` が浅すぎる handoff になっていたことを踏まえ、
+GT teacher の approach を `teacher_insert_2` まで維持してから handoff する
+中間案を試した。
+
+- Score: `83.144378073511348 / 200`
+- trial ごと:
+  - `t1=42.2124439781833`
+  - `t2=40.93193409532804`
+
+この run で分かったこと:
+
+- `T0 v2` よりは明確に回復した
+- `trial_1` では force-refine の lateral offset / depth sweep を最後まで実行できた
+- excessive force は `T0 v0/v1` ほど大きくならなかった
+- それでも `T0 v0/v1` の `86.6 / 200` すら超えられなかった
+- `trial_2` では冒頭の offset 群が依然として `2 mm` で tracking error abort した
+
+これは何を意味するか:
+
+- 「浅く handoff しすぎる」のは確かに悪い
+- しかし「少しだけ深くして blind force search に渡す」だけでも足りない
+- 本当に必要なのは、近接段階そのものを progress-gated な挿入 phase として
+  再設計することである
+
+ここで T0 系の失敗様式は 3 つに整理できた。
+
+- `T0 v0/v1`: 深すぎる GT reference により jam しやすい
+- `T0 v2`: handoff が浅すぎて abort-heavy になる
+- `T0 v3`: その中間でも proximity 止まりで insertion-led にはならない
+
+したがって、次の教師再設計は「GT approach の深さ」と「force search の有無」
+の中間点探しではなく、actual advance / tracking error / contact を見ながら
+進退を切り替える progress-gated insertion へ進むべきである。
+
 ## 現時点の証拠が実際に示していること
 
 現時点では、いくつかの点について証拠はかなり強い。
@@ -613,13 +649,13 @@ bag metadata の例:
 
 次にやるべきことは以下である。
 
-1. 最新の `T0` bag と debug artifact を、近接接触 phase に注目して解析する
+1. 最新の `T0 v3` bag と debug artifact を、近接接触 phase に注目して解析する
 2. GT 教師を次の性質を持つよう再設計する
    - 低ジャーク
    - 軸を意識している
    - リカバリ可能である
    - 明示的に挿入指向である
-3. randomized `SFP-only` で教師実現性を再実行する
+3. randomized `SFP-only` で progress-gated teacher feasibility を再実行する
 4. 教師誘導の生徒作業を再開する前提として `>= 150 / 200` を要求する
 
 このゲートを通過して初めて、プロジェクトは次へ進むべきである。
@@ -651,6 +687,7 @@ bag metadata の例:
 | `T0 v0` | randomized GT teacher feasibility | `86.653740214899685 / 200` | GT teacher はまだ挿入主導ではない |
 | `T0 v1` | terminal contact loop 付き GT teacher | `86.562241559624113 / 200` | 意味のある改善なし |
 | `T0 v2` | GT preinsert + tool-frame force refine | `70.903064258712277 / 200` | force は改善したが shallow abort に倒れた |
+| `T0 v3` | deeper GT handoff + tool-frame force refine | `83.144378073511348 / 200` | `v2` より回復したが `v0/v1` も超えられない |
 
 ## 現時点の判断
 
@@ -659,6 +696,6 @@ bag metadata の例:
 - `S2` を提出可能ベストの参照として維持する
 - `center_uvz-only` を本線として扱うのをやめる
 - 教師が改善するまで生徒データの増量を止める
-- 次に進む前に GT 教師を再設計する
+- 次に進む前に GT 教師を progress-gated insertion として再設計する
 
 以上が、ここまでの作業を最も正確に要約した内容である。

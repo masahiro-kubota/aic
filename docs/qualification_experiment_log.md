@@ -441,3 +441,31 @@ It should stay concise enough to scan quickly.
 - Next action:
   - `do not keep tuning this pure force-search handoff`
   - `instead, redesign the GT teacher around progress-gated insertion that preserves the stronger GT approach of T0 v0 while using bag-derived stall detection and recovery before student collection`
+
+## 2026-03-22 13:00 JST - T0 Randomized SFP GT Teacher Feasibility v3
+
+- Commit: `f311f92`
+- Milestone: `T0`
+- Submission-safe: `no`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=teacher_feasibility_v2`, same randomized `SFP-only` config `/home/masa/ws_aic_runtime/generated_configs/t0_teacher_sfp_rand2_seed91.yaml`, headless eval via `/entrypoint.sh`, `ground_truth:=true`, `DISPLAY=:1`, GT approach kept through `teacher_insert_2` before tool-frame force-refine handoff
+- Score total: `83.144378073511348`
+- Score by trial: `t1=42.2124439781833`, `t2=40.93193409532804`
+- Artifacts:
+  - `/home/masa/aic_results/qual_teacher_feasibility_v2_20260322_125904/eval.log`
+  - `/home/masa/aic_results/qual_teacher_feasibility_v2_20260322_125904/model.log`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_130102_teacher_feasibility_v2_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_130455_teacher_feasibility_v2_task_1`
+- Notes:
+  - `like v2, this run also left no copied scoring.yaml because the wrapper hung during teardown after scoring had already been printed; the numeric score above was recovered from eval.log`
+- What worked:
+  - `keeping the GT approach deeper clearly helped versus the shallow handoff in v2, raising the score from 70.90 / 200 to 83.14 / 200`
+  - `trial_1` was able to execute the full lateral-offset and 2-10 mm insertion-depth sweep without the early abort pattern that dominated v2`
+  - `force stayed moderate enough to avoid the huge spikes seen in the older jam-prone GT runs`
+- What failed:
+  - `the run still failed the T0 gate by a wide margin and still did not beat the older GT teacher scores around 86.6 / 200`
+  - `trial_2` still showed repeated 2 mm aborts from tracking error on the first few offsets, so the local frame was not robust enough at handoff`
+  - `both trials remained proximity-led, ending around Tier 3 ~= 23.21 and 21.93 rather than repeated insertion success`
+- Next action:
+  - `do not continue sweeping blind force-refine offsets as the main redesign path`
+  - `redesign the teacher around progress-gated insertion: keep the stronger GT approach near the mouth, watch actual advance and tracking error, and recover only after stall instead of handing off too early`

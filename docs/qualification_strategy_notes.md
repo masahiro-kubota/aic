@@ -1354,10 +1354,15 @@ Current status on 2026-03-22:
   `86.562241559624113 / 200`
 - a third run, `teacher_feasibility_v1`, switched to GT pre-insert followed by
   tool-frame force refinement and scored only `70.903064258712277 / 200`
+- a fourth run, `teacher_feasibility_v2`, kept the stronger GT insert approach
+  through `teacher_insert_2` before handing off to tool-frame force refinement
+  and scored `83.144378073511348 / 200`
 - bag/debug analysis from the failed GT runs shows that the current teacher can
   get close, but either jams while commanding too-deep reference poses
   (`T0 v0/v1`) or becomes too conservative and abort-heavy when handed off to a
   pure force search too early (`T0 v2`)
+- the deeper-handoff probe partially recovers from the shallow-abort failure,
+  but still stays proximity-led and does not beat the older GT runs (`T0 v3`)
 
 Interpretation:
 
@@ -1365,9 +1370,10 @@ Interpretation:
 - the current GT teacher also fails the `150 / 200` feasibility gate
 - therefore the next bottleneck is still teacher/controller design, not student
   learning
-- the next T0 redesign should keep the stronger GT approach from `T0 v0` longer
-  and add progress-gated recovery based on observed advance / tracking error,
-  rather than switching immediately to a pure force-search handoff
+- the next T0 redesign should become a progress-gated insertion phase that
+  keeps the stronger GT approach from `T0 v0/v3`, monitors actual advance /
+  tracking error, and only retreats or re-centers after stall is detected,
+  rather than switching directly to a blind force-search handoff
 
 #### T1. Dense Teacher Dataset
 
