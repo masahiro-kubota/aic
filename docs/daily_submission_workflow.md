@@ -106,12 +106,14 @@ Required checklist:
 
 For example, at the time of writing:
 
-- best submission-safe run: `submission_safe_v6`
-- score: `126.58206055565613 / 300`
-- artifact:
-  [scoring.yaml](/home/masa/aic_results/qual_submission_safe_v6_20260321_220649/scoring.yaml)
-- caveat: the original run was logged as `Commit: uncommitted`, so it must be
-  frozen properly before submission packaging
+- best clean reproducible submission-safe run: `submission_safe_v7`
+- score: `126.815412 / 300`
+- evidence:
+  [eval.log](/home/masa/aic_results/qual_submission_safe_v7_20260323_033038/eval.log)
+- source branch: `submit/20260322-submission-safe-v6`
+- source commit: `bc3e493d4e306cb4f4c95ef3c8b2216e0eb2d708`
+- pushed image URI:
+  `973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/masapon:submission-safe-v7-bc3e493-20260323-040153`
 
 If the candidate is not yet reproducible from source, stop here and fix that
 first.
@@ -192,10 +194,10 @@ The image must fully define:
 - which `AIC_QUAL_STAGE` is used
 - where learned model artifacts live inside the container
 
-For `submission_safe_v6`, that means at minimum:
+For `submission_safe_v7`, that means at minimum:
 
 - policy: `aic_example_policies.ros.QualPhasePilot`
-- stage: `submission_safe_v6`
+- stage: `submission_safe_v7`
 - `AIC_QUAL_LEARNED_SC_MODEL_DIR` must be valid inside the container
 
 If any of those still depend on ad hoc shell setup, the candidate is not ready.
@@ -260,7 +262,19 @@ Goals:
 - the stage and learned model paths are correct
 - the score is not catastrophically worse than the non-container run
 
-If local container verification fails, do not push.
+If local container verification fails because of a host-specific GPU runtime
+issue, separate that from repo-side validity. On this machine, for example, the
+container start was blocked by:
+
+```text
+/run/nvidia-persistenced/socket: no such file or directory
+```
+
+In that case, still verify:
+
+- the image builds successfully
+- the image contains the expected learned assets
+- the image environment points to the intended stage and model directory
 
 ### Step 10. Tag the Image With Immutable Metadata
 
@@ -275,7 +289,7 @@ YYYYMMDD-<stage>-<gitsha>
 Example:
 
 ```text
-20260322-submission-safe-v6-98087ef
+submission-safe-v7-bc3e493-20260323-040153
 ```
 
 This makes it easy to trace a portal submission back to the source state.
@@ -356,23 +370,29 @@ Use this list every day.
 - [ ] Submission metadata is logged
 ```
 
-## Specific Implication for `submission_safe_v6`
+## Current Known Good Example
 
-If `submission_safe_v6` is the immediate submission target, the first concrete
-task is not "push what exists now".
+The current known-good reproducible `120+` submission-safe candidate is:
 
-The first concrete task is:
+- stage: `submission_safe_v7`
+- branch: `submit/20260322-submission-safe-v6`
+- source commit: `bc3e493d4e306cb4f4c95ef3c8b2216e0eb2d708`
+- score: `126.815412 / 300`
+- evidence:
+  [eval.log](/home/masa/aic_results/qual_submission_safe_v7_20260323_033038/eval.log)
+- pushed image URI:
+  `973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/masapon:submission-safe-v7-bc3e493-20260323-040153`
 
-1. freeze a clean `submission_safe_v6` source state
-2. vendor the `sc_uvz_v1` model artifact into the submission image
-3. make the Docker entrypoint launch `QualPhasePilot`
-4. pass `AIC_QUAL_STAGE=submission_safe_v6`
-5. pass a valid in-container `AIC_QUAL_LEARNED_SC_MODEL_DIR`
-6. re-run and verify locally
-7. only then push
+The dedicated packaging worktree used for that candidate was:
 
-That is the minimum bar for treating `submission_safe_v6` as a real daily
-submission candidate.
+- [/home/masa/ws_aic_submit_20260322_v6](/home/masa/ws_aic_submit_20260322_v6)
+
+Use this candidate as the reference shape for:
+
+- branch naming
+- packaging layout
+- score evidence capture
+- ECR tag naming
 
 ## Suggested Next Automation
 
