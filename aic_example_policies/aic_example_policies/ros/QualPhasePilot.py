@@ -22,6 +22,7 @@ import os
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import cv2
 import numpy as np
@@ -70,6 +71,59 @@ def _pose_to_dict(pose: Pose | None) -> dict | None:
             "w": float(pose.orientation.w),
         },
     }
+
+
+def _build_learned_runtime_aux_vector(
+    current_pose: Pose,
+    feature_summary: dict | None,
+    step_index: int = 1,
+    max_steps: int = 8,
+) -> np.ndarray:
+    image_shape = (
+        list(feature_summary.get("image_shape", [1152, 1024]))
+        if isinstance(feature_summary, dict)
+        else [1152, 1024]
+    )
+    image_width = max(float(image_shape[0]), 1.0)
+    image_height = max(float(image_shape[1]), 1.0)
+    center_camera = (
+        feature_summary.get("center_camera", {})
+        if isinstance(feature_summary, dict)
+        else {}
+    )
+    union_bbox = center_camera.get("union_bbox_xywh")
+    if union_bbox is not None and len(union_bbox) == 4:
+        x, y, width, height = [float(value) for value in union_bbox]
+        center_u = x + width * 0.5
+        center_v = y + height * 0.5
+        feature_values = np.array(
+            [
+                1.0,
+                (center_u / image_width) * 2.0 - 1.0,
+                (center_v / image_height) * 2.0 - 1.0,
+                width / image_width,
+                height / image_height,
+                min(float(center_camera.get("component_count", 0)) / 20.0, 1.0),
+            ],
+            dtype=np.float32,
+        )
+    else:
+        feature_values = np.zeros(6, dtype=np.float32)
+    step_fraction = float(max(step_index - 1, 0)) / float(max(max_steps - 1, 1))
+    return np.array(
+        [
+            float(current_pose.position.x),
+            float(current_pose.position.y),
+            float(current_pose.position.z),
+            float(current_pose.orientation.x),
+            float(current_pose.orientation.y),
+            float(current_pose.orientation.z),
+            float(current_pose.orientation.w),
+            *feature_values.tolist(),
+            step_fraction,
+        ],
+        dtype=np.float32,
+    )
 
 
 def _wrench_to_dict(wrench_msg) -> dict:
@@ -398,6 +452,16 @@ class QualPhasePilot(Policy):
         -0.350186974,
         0.936679805,
     )
+    _SFP_POST_SERVO_INSERT_TRANSLATION_DELTAS_BASE = {
+        "nic_card_mount_0": (0.000728, 0.031514, -0.117908),
+        "nic_card_mount_1": (0.000797, 0.067410, -0.113470),
+    }
+    _SFP_POST_SERVO_INSERT_ROTATION_DELTA_ROTVEC_BASE = (
+        -0.37067,
+        0.01032,
+        -0.05592,
+    )
+    _SFP_POST_SERVO_INSERT_SEGMENT_FRACTIONS = (0.34, 0.33, 0.33)
     _SC_TOOL_INSERTION_AXIS = (
         0.43965921,
         -0.45945677,
@@ -457,7 +521,9 @@ class QualPhasePilot(Policy):
         self._learned_collection_split = os.environ.get(
             "AIC_LEARNED_PORT_DATASET_SPLIT", "train"
         )
-        self._learned_model_dir = os.environ.get("AIC_QUAL_LEARNED_SC_MODEL_DIR")
+        self._learned_sc_model_dir = os.environ.get("AIC_QUAL_LEARNED_SC_MODEL_DIR")
+        self._learned_sfp_model_dir = os.environ.get("AIC_QUAL_LEARNED_SFP_MODEL_DIR")
+        self._learned_model_dir = self._learned_sc_model_dir
         self._enable_sc_refinement = (
             os.environ.get("AIC_QUAL_ENABLE_SC_REFINEMENT", "false").lower() == "true"
         )
@@ -465,7 +531,7 @@ class QualPhasePilot(Policy):
         self._tip_y_error_integrator = 0.0
         self._max_integrator_windup = 0.05
         self._learned_dataset_writer: GroundTruthPortDatasetWriter | None = None
-        self._learned_port_inference: LearnedPortInference | None = None
+        self._learned_port_inference_by_plug: dict[str, LearnedPortInference] = {}
         self._public_trial_pilot = PublicTrialPosePilot(parent_node)
         self.get_logger().info(f"QualPhasePilot.__init__() stage={self._stage}")
 
@@ -540,15 +606,37 @@ class QualPhasePilot(Policy):
         while time.monotonic() < deadline:
             observation = get_observation()
             if observation is None:
-                self.sleep_for(0.05)
+                time.sleep(0.05)
                 continue
             if newer_than_sec is None:
                 return observation
             observation_stamp_sec = _stamp_to_float(observation.center_image.header.stamp)
             if observation_stamp_sec > newer_than_sec + 1e-6:
                 return observation
-            self.sleep_for(0.05)
+            # Use wall-time polling here. If sim time stalls or the camera timestamp
+            # stops updating, a sim-time sleep can deadlock the whole task callback.
+            self._wait_for_sim_progress(0.05)
         return None
+
+    def _wait_for_sim_progress(
+        self,
+        duration_sec: float,
+        wall_timeout_scale: float = 6.0,
+        min_wall_timeout_sec: float = 0.25,
+        poll_period_sec: float = 0.01,
+    ) -> bool:
+        if duration_sec <= 0.0:
+            return True
+        start_sim_sec = self.time_now().nanoseconds / 1e9
+        deadline = time.monotonic() + max(
+            min_wall_timeout_sec, duration_sec * wall_timeout_scale
+        )
+        while time.monotonic() < deadline:
+            sim_elapsed_sec = self.time_now().nanoseconds / 1e9 - start_sim_sec
+            if sim_elapsed_sec + 1e-4 >= duration_sec:
+                return True
+            time.sleep(poll_period_sec)
+        return False
 
     def _hold_pose(
         self,
@@ -568,7 +656,7 @@ class QualPhasePilot(Policy):
                     self.time_now().nanoseconds / 1e9,
                     note=f"hold step {step + 1}/{steps}",
                 )
-            self.sleep_for(self._command_period_sec)
+            self._wait_for_sim_progress(self._command_period_sec)
 
     def _move_for_duration(
         self,
@@ -594,7 +682,7 @@ class QualPhasePilot(Policy):
                     self.time_now().nanoseconds / 1e9,
                     note=f"interp {step}/{steps}",
                 )
-            self.sleep_for(self._command_period_sec)
+            self._wait_for_sim_progress(self._command_period_sec)
 
     def _extract_feature_summary(
         self, task: Task, observation: Observation | None
@@ -783,14 +871,46 @@ class QualPhasePilot(Policy):
             )
         return self._learned_dataset_writer
 
-    def _learned_port_inference_or_none(self) -> LearnedPortInference | None:
-        if self._learned_model_dir is None:
+    def _learned_port_inference_or_none(
+        self, plug_type: str = "sc"
+    ) -> LearnedPortInference | None:
+        model_dir = (
+            self._learned_sc_model_dir
+            if plug_type == "sc"
+            else self._learned_sfp_model_dir
+        )
+        if model_dir is None:
             return None
-        if self._learned_port_inference is None:
-            self._learned_port_inference = LearnedPortInference.load(
-                self._learned_model_dir
+        if plug_type not in self._learned_port_inference_by_plug:
+            self._learned_port_inference_by_plug[plug_type] = LearnedPortInference.load(
+                model_dir
             )
-        return self._learned_port_inference
+        return self._learned_port_inference_by_plug[plug_type]
+
+    def _learned_phase_template_uvz(
+        self,
+        plug_type: str,
+        task: Task,
+        template_name: str,
+        fallback_uvz: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        estimator = self._learned_port_inference_or_none(plug_type)
+        if estimator is None:
+            return fallback_uvz
+        task_key = "|".join(self._task_key(task))
+        manifest = getattr(estimator, "manifest", {})
+        task_templates = manifest.get("phase_templates", {}).get(task_key, {})
+        template = task_templates.get(template_name)
+        if template is None:
+            return fallback_uvz
+        center_uvz = template.get("center_uvz_median")
+        if not isinstance(center_uvz, list) or len(center_uvz) != 3:
+            return fallback_uvz
+        return (
+            float(center_uvz[0]),
+            float(center_uvz[1]),
+            float(center_uvz[2]),
+        )
 
     def _capture_gt_port_sample(
         self,
@@ -798,6 +918,7 @@ class QualPhasePilot(Policy):
         observation: Observation | None,
         phase: str,
         extra: dict | None = None,
+        label_overrides: dict | None = None,
     ) -> dict | None:
         writer = self._learned_dataset_writer_or_none()
         if writer is None or observation is None:
@@ -805,6 +926,22 @@ class QualPhasePilot(Policy):
         port_pose = self._lookup_frame_pose_base(self._port_frame_name(task))
         if port_pose is None:
             return None
+        teacher_hover_pose = self._gt_teacher_gripper_pose(
+            task,
+            self._port_frame_name(task),
+            slerp_fraction=1.0,
+            position_fraction=1.0,
+            z_offset=0.16 if task.plug_type == "sfp" else 0.18,
+            update_integrator=False,
+        )
+        teacher_insert_pose = self._gt_teacher_gripper_pose(
+            task,
+            self._port_frame_name(task),
+            slerp_fraction=1.0,
+            position_fraction=1.0,
+            z_offset=0.08 if task.plug_type == "sfp" else 0.11,
+            update_integrator=False,
+        )
         _, target_point_base = port_pose
         per_camera: dict[str, dict] = {}
         images_bgr: dict[str, np.ndarray] = {}
@@ -826,18 +963,24 @@ class QualPhasePilot(Policy):
                 "k": [float(value) for value in camera_info.k],
             }
         observation_stamp_sec = _stamp_to_float(observation.center_image.header.stamp)
+        labels = {
+            "port_frame": self._port_frame_name(task),
+            "target_point_base": [float(value) for value in target_point_base],
+            "current_tcp_pose": _pose_to_dict(observation.controller_state.tcp_pose),
+            "teacher_hover_pose": _pose_to_dict(teacher_hover_pose),
+            "teacher_insert_pose": _pose_to_dict(teacher_insert_pose),
+            "per_camera": per_camera,
+            "camera_info": camera_infos,
+        }
+        if label_overrides:
+            labels.update(label_overrides)
         return writer.append_sample(
             task=task,
             stage=self._stage,
             phase=phase,
             observation_stamp_sec=observation_stamp_sec,
             images_bgr=images_bgr,
-            labels={
-                "port_frame": self._port_frame_name(task),
-                "target_point_base": [float(value) for value in target_point_base],
-                "per_camera": per_camera,
-                "camera_info": camera_infos,
-            },
+            labels=labels,
             extra=extra,
         )
 
@@ -849,6 +992,7 @@ class QualPhasePilot(Policy):
         position_fraction: float = 1.0,
         z_offset: float = 0.1,
         reset_xy_integrator: bool = False,
+        update_integrator: bool = True,
     ) -> Pose | None:
         port_tf = self._lookup_frame_transform_base(port_frame)
         plug_tf = self._lookup_frame_transform_base(
@@ -871,24 +1015,35 @@ class QualPhasePilot(Policy):
 
         tip_x_error = float(port_xyz[0] - plug_xyz[0])
         tip_y_error = float(port_xyz[1] - plug_xyz[1])
-        if reset_xy_integrator:
-            self._tip_x_error_integrator = 0.0
-            self._tip_y_error_integrator = 0.0
+        integral_x = 0.0
+        integral_y = 0.0
+        if update_integrator:
+            if reset_xy_integrator:
+                self._tip_x_error_integrator = 0.0
+                self._tip_y_error_integrator = 0.0
+            else:
+                self._tip_x_error_integrator = float(
+                    np.clip(
+                        self._tip_x_error_integrator + tip_x_error,
+                        -self._max_integrator_windup,
+                        self._max_integrator_windup,
+                    )
+                )
+                self._tip_y_error_integrator = float(
+                    np.clip(
+                        self._tip_y_error_integrator + tip_y_error,
+                        -self._max_integrator_windup,
+                        self._max_integrator_windup,
+                    )
+                )
+            integral_x = self._tip_x_error_integrator
+            integral_y = self._tip_y_error_integrator
+        elif reset_xy_integrator:
+            integral_x = 0.0
+            integral_y = 0.0
         else:
-            self._tip_x_error_integrator = float(
-                np.clip(
-                    self._tip_x_error_integrator + tip_x_error,
-                    -self._max_integrator_windup,
-                    self._max_integrator_windup,
-                )
-            )
-            self._tip_y_error_integrator = float(
-                np.clip(
-                    self._tip_y_error_integrator + tip_y_error,
-                    -self._max_integrator_windup,
-                    self._max_integrator_windup,
-                )
-            )
+            integral_x = 0.0
+            integral_y = 0.0
 
         i_gain = 0.15
         plug_tip_gripper_offset = (
@@ -896,8 +1051,8 @@ class QualPhasePilot(Policy):
             gripper_xyz[1] - plug_xyz[1],
             gripper_xyz[2] - plug_xyz[2],
         )
-        target_x = port_xyz[0] + i_gain * self._tip_x_error_integrator
-        target_y = port_xyz[1] + i_gain * self._tip_y_error_integrator
+        target_x = port_xyz[0] + i_gain * integral_x
+        target_y = port_xyz[1] + i_gain * integral_y
         target_z = port_xyz[2] + z_offset - plug_tip_gripper_offset[2]
         blend_xyz = (
             position_fraction * target_x + (1.0 - position_fraction) * gripper_xyz[0],
@@ -1125,18 +1280,31 @@ class QualPhasePilot(Policy):
         }
 
     def _sc_learned_feature(
-        self, task: Task, observation: Observation | None
+        self,
+        task: Task,
+        observation: Observation | None,
+        *,
+        step_index: int = 1,
+        max_steps: int = 1,
     ) -> dict | None:
         if observation is None:
             return None
-        estimator = self._learned_port_inference_or_none()
+        estimator = self._learned_port_inference_or_none("sc")
         if estimator is None:
             return None
+
+        feature_summary = self._extract_feature_summary(task, observation)
+        aux_vector = _build_learned_runtime_aux_vector(
+            current_pose=observation.controller_state.tcp_pose,
+            feature_summary=feature_summary,
+            step_index=step_index,
+            max_steps=max_steps,
+        )
 
         left_image = _image_to_bgr(observation.left_image)
         center_image = _image_to_bgr(observation.center_image)
         right_image = _image_to_bgr(observation.right_image)
-        predicted = estimator.predict_center_uvz(
+        predicted = cast(Any, estimator).predict_center_uvz(
             task=task,
             images_bgr={
                 "left": left_image,
@@ -1144,6 +1312,7 @@ class QualPhasePilot(Policy):
                 "right": right_image,
             },
             center_camera_k=[float(value) for value in observation.center_camera_info.k],
+            aux_vector=aux_vector,
         )
 
         raw_center_feature = self._sc_feature_for_camera(observation, "center")
@@ -1188,6 +1357,69 @@ class QualPhasePilot(Policy):
             "raw_center_feature": raw_center_feature,
         }
 
+    def _sfp_learned_feature(
+        self,
+        task: Task,
+        observation: Observation | None,
+        *,
+        step_index: int = 1,
+        max_steps: int = 1,
+    ) -> dict | None:
+        if observation is None:
+            return None
+        estimator = self._learned_port_inference_or_none("sfp")
+        if estimator is None:
+            return None
+
+        feature_summary = self._extract_feature_summary(task, observation)
+        aux_vector = _build_learned_runtime_aux_vector(
+            current_pose=observation.controller_state.tcp_pose,
+            feature_summary=feature_summary,
+            step_index=step_index,
+            max_steps=max_steps,
+        )
+
+        predicted = cast(Any, estimator).predict_center_uvz(
+            task=task,
+            images_bgr={
+                "left": _image_to_bgr(observation.left_image),
+                "center": _image_to_bgr(observation.center_image),
+                "right": _image_to_bgr(observation.right_image),
+            },
+            center_camera_k=[float(value) for value in observation.center_camera_info.k],
+            aux_vector=aux_vector,
+        )
+        predicted_center_uvz = np.array(predicted["center_uvz"], dtype=float)
+        desired_uv = (float(predicted_center_uvz[0]), float(predicted_center_uvz[1]))
+        point_center_optical = self._desired_point_in_camera(
+            observation.center_camera_info,
+            desired_uv,
+            float(predicted_center_uvz[2]),
+        )
+        if point_center_optical is None:
+            return None
+        center_pose = self._lookup_camera_pose_base_from_optical(self._CENTER_CAMERA_FRAME)
+        if center_pose is None:
+            return None
+        rotation_base_from_optical, translation_base = center_pose
+        point_base = translation_base + (rotation_base_from_optical @ point_center_optical)
+        raw_center_feature = self._sfp_union_feature(observation)
+        return {
+            "source": "learned_center_uvz",
+            "triangulated_point_base": point_base,
+            "point_center_optical": point_center_optical,
+            "center_feature": {
+                "union_center_uv": desired_uv,
+                "union_size_px": (
+                    None
+                    if raw_center_feature is None
+                    else raw_center_feature.get("union_size_px")
+                ),
+            },
+            "predicted_center_uvz": [float(value) for value in predicted_center_uvz],
+            "raw_center_feature": raw_center_feature,
+        }
+
     def _desired_point_in_camera(
         self,
         camera_info: CameraInfo,
@@ -1210,6 +1442,201 @@ class QualPhasePilot(Policy):
             ],
             dtype=float,
         )
+
+    def _rotvec_to_rotation_matrix(self, rotvec: np.ndarray) -> np.ndarray:
+        angle = float(np.linalg.norm(rotvec))
+        if angle < 1e-9:
+            return np.eye(3, dtype=float)
+        axis = np.array(rotvec, dtype=float) / angle
+        x, y, z = axis
+        skew = np.array(
+            [
+                [0.0, -z, y],
+                [z, 0.0, -x],
+                [-y, x, 0.0],
+            ],
+            dtype=float,
+        )
+        return (
+            np.eye(3, dtype=float)
+            + math.sin(angle) * skew
+            + (1.0 - math.cos(angle)) * (skew @ skew)
+        )
+
+    def _rotation_matrix_to_rotvec(self, rotation: np.ndarray) -> np.ndarray:
+        trace = float(np.trace(rotation))
+        angle = float(np.arccos(np.clip((trace - 1.0) * 0.5, -1.0, 1.0)))
+        if angle < 1e-8:
+            return np.zeros(3, dtype=float)
+        axis = np.array(
+            [
+                rotation[2, 1] - rotation[1, 2],
+                rotation[0, 2] - rotation[2, 0],
+                rotation[1, 0] - rotation[0, 1],
+            ],
+            dtype=float,
+        )
+        axis /= max(2.0 * math.sin(angle), 1e-6)
+        return axis * angle
+
+    def _pose_delta_base(
+        self,
+        current_pose: Pose,
+        target_pose: Pose,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        translation_delta = self._pose_position(target_pose) - self._pose_position(
+            current_pose
+        )
+        current_rotation = quat2mat(self._quat_xyzw_to_wxyz(current_pose.orientation))
+        target_rotation = quat2mat(self._quat_xyzw_to_wxyz(target_pose.orientation))
+        rotation_delta = target_rotation @ current_rotation.T
+        return translation_delta, self._rotation_matrix_to_rotvec(rotation_delta)
+
+    def _clamp_sfp_teacher_step_delta(
+        self,
+        translation_delta_base: np.ndarray,
+        rotation_delta_rotvec_base: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        translation_delta = np.array(translation_delta_base, dtype=float).copy()
+        translation_delta[0] = float(np.clip(translation_delta[0], -0.010, 0.010))
+        translation_delta[1] = float(np.clip(translation_delta[1], -0.020, 0.020))
+        translation_delta[2] = float(np.clip(translation_delta[2], -0.020, 0.010))
+        rotation_delta = np.array(rotation_delta_rotvec_base, dtype=float).copy()
+        rotation_norm = float(np.linalg.norm(rotation_delta))
+        if rotation_norm > 0.14:
+            rotation_delta *= 0.14 / rotation_norm
+        return translation_delta, rotation_delta
+
+    def _apply_pose_residual_base(
+        self,
+        current_pose: Pose,
+        translation_delta_base: np.ndarray,
+        rotation_delta_rotvec_base: np.ndarray,
+    ) -> Pose:
+        current_quat_wxyz = self._quat_xyzw_to_wxyz(current_pose.orientation)
+        current_rotation = quat2mat(current_quat_wxyz)
+        residual_rotation = self._rotvec_to_rotation_matrix(rotation_delta_rotvec_base)
+        target_rotation = residual_rotation @ current_rotation
+        target_quat_wxyz = mat2quat(target_rotation)
+        return self._make_pose(
+            self._pose_position(current_pose) + np.array(translation_delta_base, dtype=float),
+            (
+                float(target_quat_wxyz[0]),
+                float(target_quat_wxyz[1]),
+                float(target_quat_wxyz[2]),
+                float(target_quat_wxyz[3]),
+            ),
+        )
+
+    def _sfp_post_servo_insert_delta(
+        self, task: Task
+    ) -> tuple[np.ndarray, np.ndarray]:
+        translation = np.array(
+            self._SFP_POST_SERVO_INSERT_TRANSLATION_DELTAS_BASE.get(
+                task.target_module_name,
+                self._SFP_POST_SERVO_INSERT_TRANSLATION_DELTAS_BASE[
+                    "nic_card_mount_0"
+                ],
+            ),
+            dtype=float,
+        )
+        rotation = np.array(
+            self._SFP_POST_SERVO_INSERT_ROTATION_DELTA_ROTVEC_BASE, dtype=float
+        )
+        return translation, rotation
+
+    def _run_sfp_submission_structured_teacher_insert(
+        self,
+        task: Task,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+    ) -> tuple[Pose, Observation | None, dict]:
+        translation_delta_base, rotation_delta_rotvec_base = (
+            self._sfp_post_servo_insert_delta(task)
+        )
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(
+            initial_observation,
+            initial_observation.controller_state.reference_tcp_pose,
+        )
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        segment_records: list[dict[str, object]] = []
+
+        for segment_index, fraction in enumerate(
+            self._SFP_POST_SERVO_INSERT_SEGMENT_FRACTIONS, start=1
+        ):
+            segment_translation = fraction * translation_delta_base
+            segment_rotation = fraction * rotation_delta_rotvec_base
+            target_pose = self._apply_pose_residual_base(
+                current_pose,
+                translation_delta_base=segment_translation,
+                rotation_delta_rotvec_base=segment_rotation,
+            )
+            debug_run.log_command_sample(
+                "submission_sfp_structured_teacher_insert",
+                target_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"segment={segment_index}/{len(self._SFP_POST_SERVO_INSERT_SEGMENT_FRACTIONS)} "
+                    f"fraction={fraction:.2f} "
+                    f"dx={segment_translation[0]:.4f} dy={segment_translation[1]:.4f} dz={segment_translation[2]:.4f} "
+                    f"rot=({segment_rotation[0]:.4f},{segment_rotation[1]:.4f},{segment_rotation[2]:.4f})"
+                ),
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.30,
+                debug_run=debug_run,
+                phase_name=f"submission_sfp_structured_insert_segment_{segment_index}",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=0.14,
+                debug_run=debug_run,
+                phase_name=f"submission_sfp_structured_insert_settle_{segment_index}",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(
+                    next_observation.center_image.header.stamp
+                )
+                current_pose = self._observed_tcp_pose(next_observation, target_pose)
+            else:
+                current_pose = target_pose
+
+            segment_records.append(
+                {
+                    "segment_index": segment_index,
+                    "fraction": float(fraction),
+                    "translation_delta_base": [
+                        float(value) for value in segment_translation
+                    ],
+                    "rotation_delta_rotvec_base": [
+                        float(value) for value in segment_rotation
+                    ],
+                    "target_pose": _pose_to_dict(target_pose),
+                }
+            )
+
+        return current_pose, current_observation, {
+            "translation_delta_base": [
+                float(value) for value in translation_delta_base
+            ],
+            "rotation_delta_rotvec_base": [
+                float(value) for value in rotation_delta_rotvec_base
+            ],
+            "segments": segment_records,
+        }
 
     def _rotate_quat_about_camera_optical(
         self,
@@ -1304,6 +1731,15 @@ class QualPhasePilot(Policy):
         axis_tool_np /= max(np.linalg.norm(axis_tool_np), 1e-6)
         return quat2mat(self._quat_xyzw_to_wxyz(pose.orientation)) @ axis_tool_np
 
+    def _observed_tcp_pose(
+        self,
+        observation: Observation | None,
+        fallback_pose: Pose,
+    ) -> Pose:
+        if observation is None:
+            return fallback_pose
+        return observation.controller_state.tcp_pose
+
     def _run_tool_axis_push(
         self,
         move_robot: MoveRobotCallback,
@@ -1337,6 +1773,207 @@ class QualPhasePilot(Policy):
             phase_name=f"{phase_prefix}_hold",
         )
         return pushed_pose
+
+    def _run_sfp_closed_loop_insertion(
+        self,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        push_schedule_m: tuple[float, ...] = (0.003, 0.003, 0.004, 0.004, 0.004, 0.003),
+    ) -> tuple[Pose, Observation | None, dict]:
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(
+            initial_observation,
+            initial_observation.controller_state.reference_tcp_pose,
+        )
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        cycle_records: list[dict[str, object]] = []
+
+        for cycle_index, push_distance_m in enumerate(push_schedule_m, start=1):
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                current_observation if current_observation is not None else initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                max_steps=8,
+            )
+            if aligned_observation is not None:
+                current_observation = aligned_observation
+                last_stamp_sec = _stamp_to_float(
+                    aligned_observation.center_image.header.stamp
+                )
+            if aligned_pose is not None:
+                current_pose = self._observed_tcp_pose(current_observation, aligned_pose)
+            elif current_observation is not None:
+                current_pose = current_observation.controller_state.tcp_pose
+
+            feature_before = self._sfp_union_feature(current_observation)
+            axis_base = self._tool_axis_in_base(current_pose, self._SFP_TOOL_INSERTION_AXIS)
+            axis_base /= max(np.linalg.norm(axis_base), 1e-6)
+            pre_push_position = self._pose_position(current_pose)
+            target_pose = self._run_tool_axis_push(
+                move_robot,
+                current_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=push_distance_m,
+                duration_sec=0.24,
+                hold_sec=0.28,
+                debug_run=debug_run,
+                phase_prefix=f"submission_sfp_cycle_{cycle_index}",
+            )
+            pushed_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.6,
+            )
+            if pushed_observation is not None:
+                current_observation = pushed_observation
+                last_stamp_sec = _stamp_to_float(
+                    pushed_observation.center_image.header.stamp
+                )
+            current_pose = self._observed_tcp_pose(current_observation, target_pose)
+
+            feature_after = self._sfp_union_feature(current_observation)
+            post_push_position = self._pose_position(current_pose)
+            actual_advance_m = float(np.dot(post_push_position - pre_push_position, axis_base))
+            tracking_error_m = None
+            if current_observation is not None:
+                tracking_error_m = float(
+                    np.linalg.norm(current_observation.controller_state.tcp_error[:3])
+                )
+
+            cycle_record: dict[str, object] = {
+                "cycle_index": cycle_index,
+                "push_distance_m": float(push_distance_m),
+                "actual_advance_m": actual_advance_m,
+                "tracking_error_m": tracking_error_m,
+                "pose": _pose_to_dict(current_pose),
+                "feature_before": feature_before,
+                "feature_after": feature_after,
+            }
+            cycle_records.append(cycle_record)
+            debug_run.log_phase(
+                f"submission_sfp_cycle_{cycle_index}_summary",
+                self.time_now().nanoseconds / 1e9,
+                (
+                    f"push={push_distance_m:.4f} actual_advance={actual_advance_m:.4f} "
+                    f"tracking_error={tracking_error_m if tracking_error_m is not None else float('nan'):.4f}"
+                ),
+            )
+
+            if tracking_error_m is not None and tracking_error_m > 0.028:
+                break
+
+        return current_pose, current_observation, {"cycles": cycle_records}
+
+    def _run_sfp_incremental_insertion(
+        self,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        aligned_feature: dict | None,
+        push_schedule_m: tuple[float, ...] = (
+            0.004,
+            0.004,
+            0.004,
+            0.004,
+            0.004,
+            0.004,
+            0.003,
+            0.003,
+        ),
+    ) -> tuple[Pose, Observation | None, dict]:
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(
+            initial_observation,
+            initial_observation.controller_state.reference_tcp_pose,
+        )
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        _ = aligned_feature
+        insertion_quat_wxyz = self._quat_xyzw_to_wxyz(current_pose.orientation)
+        insertion_axis_base = quat2mat(insertion_quat_wxyz) @ np.array(
+            self._SFP_TOOL_INSERTION_AXIS, dtype=float
+        )
+        insertion_axis_base /= max(np.linalg.norm(insertion_axis_base), 1e-6)
+        stalled_cycles = 0
+        cycle_records: list[dict[str, object]] = []
+
+        for cycle_index, push_distance_m in enumerate(push_schedule_m, start=1):
+            pre_push_position = self._pose_position(current_pose)
+            target_pose = self._make_pose(
+                pre_push_position + push_distance_m * insertion_axis_base,
+                insertion_quat_wxyz,
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.16,
+                debug_run=debug_run,
+                phase_name=f"submission_sfp_cycle_{cycle_index}_push",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=0.20,
+                debug_run=debug_run,
+                phase_name=f"submission_sfp_cycle_{cycle_index}_hold",
+            )
+            pushed_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.35,
+                newer_than_sec=last_stamp_sec,
+            )
+            if pushed_observation is None:
+                pushed_observation = get_observation()
+            if pushed_observation is not None:
+                current_observation = pushed_observation
+                last_stamp_sec = _stamp_to_float(
+                    pushed_observation.center_image.header.stamp
+                )
+            observed_pose = self._observed_tcp_pose(current_observation, target_pose)
+            current_pose = self._make_pose(
+                self._pose_position(observed_pose),
+                insertion_quat_wxyz,
+            )
+
+            post_push_position = self._pose_position(current_pose)
+            actual_advance_m = float(
+                np.dot(post_push_position - pre_push_position, insertion_axis_base)
+            )
+            tracking_error_m = None
+            if current_observation is not None:
+                tracking_error_m = float(
+                    np.linalg.norm(current_observation.controller_state.tcp_error[:3])
+                )
+
+            if actual_advance_m < 0.0008:
+                stalled_cycles += 1
+            else:
+                stalled_cycles = 0
+
+            cycle_record: dict[str, object] = {
+                "cycle_index": cycle_index,
+                "push_distance_m": float(push_distance_m),
+                "actual_advance_m": actual_advance_m,
+                "tracking_error_m": tracking_error_m,
+                "pose": _pose_to_dict(current_pose),
+            }
+            cycle_records.append(cycle_record)
+            debug_run.log_phase(
+                f"submission_sfp_cycle_{cycle_index}_summary",
+                self.time_now().nanoseconds / 1e9,
+                (
+                    f"push={push_distance_m:.4f} actual_advance={actual_advance_m:.4f} "
+                    f"tracking_error={tracking_error_m if tracking_error_m is not None else float('nan'):.4f}"
+                ),
+            )
+
+            if stalled_cycles >= 2:
+                break
+
+        return current_pose, current_observation, {"cycles": cycle_records}
 
     def _run_sfp_submission_servo(
         self,
@@ -1448,6 +2085,697 @@ class QualPhasePilot(Policy):
         if final_observation is None:
             final_observation = observation
         return best_pose, final_observation, best_feature
+
+    def _run_sfp_submission_learned_servo(
+        self,
+        task: Task,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        desired_uv: tuple[float, float],
+        desired_depth_m: float,
+        max_steps: int = 16,
+        position_gain: float = 0.72,
+        max_step_m: float = 0.018,
+        align_tol_px: float = 24.0,
+        depth_tol_m: float = 0.015,
+        phase_name: str = "submission_sfp_learned_servo",
+        settle_phase_name: str = "submission_sfp_learned_settle",
+    ) -> tuple[Pose | None, Observation | None, dict | None]:
+        learned_feature = self._sfp_learned_feature(
+            task,
+            initial_observation,
+            step_index=1,
+            max_steps=max_steps,
+        )
+        if learned_feature is None:
+            return None, initial_observation, None
+
+        desired_point_optical = self._desired_point_in_camera(
+            initial_observation.center_camera_info,
+            desired_uv,
+            desired_depth_m,
+        )
+        if desired_point_optical is None:
+            return None, initial_observation, learned_feature
+
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        observation = initial_observation
+        best_pose = initial_observation.controller_state.tcp_pose
+        best_feature = learned_feature
+
+        for step in range(max_steps):
+            learned_feature = self._sfp_learned_feature(
+                task,
+                observation,
+                step_index=step + 1,
+                max_steps=max_steps,
+            )
+            if learned_feature is None:
+                break
+            best_feature = learned_feature
+            current_pose = observation.controller_state.tcp_pose
+            current_point_optical = learned_feature["point_center_optical"]
+            center_uv = learned_feature["center_feature"]["union_center_uv"]
+            du = float(center_uv[0] - desired_uv[0])
+            dv = float(center_uv[1] - desired_uv[1])
+            depth_error_m = float(current_point_optical[2] - desired_depth_m)
+            aligned = (
+                abs(du) < align_tol_px
+                and abs(dv) < align_tol_px
+                and abs(depth_error_m) < depth_tol_m
+            )
+            center_pose = self._lookup_camera_pose_base_from_optical(
+                self._CENTER_CAMERA_FRAME
+            )
+            if center_pose is None:
+                break
+            rotation_base_from_optical, _camera_origin_base = center_pose
+            optical_error = np.array(current_point_optical, dtype=float) - np.array(
+                desired_point_optical, dtype=float
+            )
+            delta_base = rotation_base_from_optical @ optical_error
+            delta_norm = float(np.linalg.norm(delta_base))
+            if delta_norm > max_step_m:
+                delta_base *= max_step_m / delta_norm
+            else:
+                delta_base *= position_gain
+            debug_run.log_command_sample(
+                phase_name,
+                current_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"step {step + 1}/{max_steps} learned_du={du:.1f} "
+                    f"learned_dv={dv:.1f} depth={current_point_optical[2]:.3f} "
+                    f"desired_depth={desired_depth_m:.3f} "
+                    f"optical_err=({optical_error[0]:.4f},{optical_error[1]:.4f},{optical_error[2]:.4f}) "
+                    f"delta_base=({delta_base[0]:.4f},{delta_base[1]:.4f},{delta_base[2]:.4f})"
+                ),
+            )
+            if aligned:
+                best_pose = current_pose
+                break
+
+            target_pose = self._make_pose(
+                self._pose_position(current_pose) + delta_base,
+                self._quat_xyzw_to_wxyz(current_pose.orientation),
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.18,
+                debug_run=debug_run,
+                phase_name=phase_name,
+            )
+            best_pose = target_pose
+            observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if observation is None:
+                break
+            last_stamp_sec = _stamp_to_float(observation.center_image.header.stamp)
+
+        self._hold_pose(
+            move_robot,
+            best_pose,
+            duration_sec=0.25,
+            debug_run=debug_run,
+            phase_name=settle_phase_name,
+        )
+        final_observation = self._wait_for_observation(
+            get_observation,
+            timeout_sec=0.8,
+            newer_than_sec=last_stamp_sec,
+        )
+        if final_observation is None:
+            final_observation = observation
+        return best_pose, final_observation, best_feature
+
+    def _run_sfp_submission_learned_teacher_insert_residual(
+        self,
+        task: Task,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        max_iterations: int = 2,
+    ) -> tuple[Pose | None, Observation | None, dict]:
+        estimator = self._learned_port_inference_or_none("sfp")
+        if estimator is None:
+            return None, initial_observation, {"error": "missing_estimator"}
+        if estimator.target_kind != "teacher_insert_delta6":
+            return None, initial_observation, {
+                "error": f"unexpected_target_kind:{estimator.target_kind}"
+            }
+
+        current_observation: Observation | None = initial_observation
+        current_pose = initial_observation.controller_state.tcp_pose
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        prediction_records: list[dict[str, object]] = []
+
+        for iteration_index in range(1, max_iterations + 1):
+            if current_observation is None:
+                break
+            current_feature_summary = self._extract_feature_summary(
+                task, current_observation
+            )
+            prediction = cast(Any, estimator).predict_target_vector(
+                task=task,
+                images_bgr={
+                    "left": _image_to_bgr(current_observation.left_image),
+                    "center": _image_to_bgr(current_observation.center_image),
+                    "right": _image_to_bgr(current_observation.right_image),
+                },
+                aux_vector=_build_learned_runtime_aux_vector(
+                    current_pose=current_pose,
+                    feature_summary=current_feature_summary,
+                    step_index=iteration_index,
+                    max_steps=max_iterations,
+                ),
+            )
+            raw_vector = np.array(prediction["vector"], dtype=float)
+            translation_delta = raw_vector[:3].copy()
+            translation_delta[0] = float(np.clip(translation_delta[0], -0.035, 0.035))
+            translation_delta[1] = float(np.clip(translation_delta[1], -0.035, 0.035))
+            translation_delta[2] = float(np.clip(translation_delta[2], -0.025, 0.025))
+            rotation_delta = raw_vector[3:].copy()
+            rotation_norm = float(np.linalg.norm(rotation_delta))
+            if rotation_norm > 0.45:
+                rotation_delta *= 0.45 / rotation_norm
+
+            target_pose = self._apply_pose_residual_base(
+                current_pose,
+                translation_delta_base=translation_delta,
+                rotation_delta_rotvec_base=rotation_delta,
+            )
+            debug_run.log_command_sample(
+                "submission_sfp_learned_insert_residual",
+                target_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"iter={iteration_index} "
+                    f"dx={translation_delta[0]:.4f} dy={translation_delta[1]:.4f} dz={translation_delta[2]:.4f} "
+                    f"rot_norm={float(np.linalg.norm(rotation_delta)):.4f}"
+                ),
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.28,
+                debug_run=debug_run,
+                phase_name="submission_sfp_learned_insert_residual",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=0.16,
+                debug_run=debug_run,
+                phase_name="submission_sfp_learned_insert_residual_settle",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(
+                    next_observation.center_image.header.stamp
+                )
+                current_pose = self._observed_tcp_pose(next_observation, target_pose)
+            else:
+                current_pose = target_pose
+            prediction_records.append(
+                {
+                    "iteration_index": iteration_index,
+                    "raw_vector": [float(value) for value in raw_vector],
+                    "applied_translation_delta_base": [
+                        float(value) for value in translation_delta
+                    ],
+                    "applied_rotation_delta_rotvec_base": [
+                        float(value) for value in rotation_delta
+                    ],
+                    "feature_summary": current_feature_summary,
+                    "target_pose": _pose_to_dict(target_pose),
+                }
+            )
+            if float(np.linalg.norm(translation_delta[:2])) < 0.003 and float(
+                np.linalg.norm(rotation_delta)
+            ) < 0.05:
+                break
+
+        return current_pose, current_observation, {"predictions": prediction_records}
+
+    def _run_sfp_submission_learned_teacher_step_policy(
+        self,
+        task: Task,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        max_iterations: int = 8,
+    ) -> tuple[Pose | None, Observation | None, dict]:
+        estimator = self._learned_port_inference_or_none("sfp")
+        if estimator is None:
+            return None, initial_observation, {"error": "missing_estimator"}
+        if estimator.target_kind != "teacher_step_delta6":
+            return None, initial_observation, {
+                "error": f"unexpected_target_kind:{estimator.target_kind}"
+            }
+
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(
+            initial_observation,
+            initial_observation.controller_state.reference_tcp_pose,
+        )
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        prediction_records: list[dict[str, object]] = []
+
+        for iteration_index in range(1, max_iterations + 1):
+            if current_observation is None:
+                break
+            current_feature_summary = self._extract_feature_summary(
+                task, current_observation
+            )
+            prediction = cast(Any, estimator).predict_target_vector(
+                task=task,
+                images_bgr={
+                    "left": _image_to_bgr(current_observation.left_image),
+                    "center": _image_to_bgr(current_observation.center_image),
+                    "right": _image_to_bgr(current_observation.right_image),
+                },
+                aux_vector=_build_learned_runtime_aux_vector(
+                    current_pose=current_pose,
+                    feature_summary=current_feature_summary,
+                    step_index=iteration_index,
+                    max_steps=max_iterations,
+                ),
+            )
+            raw_vector = np.array(prediction["vector"], dtype=float)
+            translation_delta = raw_vector[:3].copy()
+            translation_delta[0] = float(np.clip(translation_delta[0], -0.010, 0.010))
+            translation_delta[1] = float(np.clip(translation_delta[1], -0.020, 0.020))
+            translation_delta[2] = float(np.clip(translation_delta[2], -0.020, 0.010))
+            rotation_delta = raw_vector[3:].copy()
+            rotation_norm = float(np.linalg.norm(rotation_delta))
+            if rotation_norm > 0.14:
+                rotation_delta *= 0.14 / rotation_norm
+
+            target_pose = self._apply_pose_residual_base(
+                current_pose,
+                translation_delta_base=translation_delta,
+                rotation_delta_rotvec_base=rotation_delta,
+            )
+            debug_run.log_command_sample(
+                "submission_sfp_learned_teacher_step",
+                target_pose,
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    f"iter={iteration_index} "
+                    f"dx={translation_delta[0]:.4f} dy={translation_delta[1]:.4f} dz={translation_delta[2]:.4f} "
+                    f"rot_norm={float(np.linalg.norm(rotation_delta)):.4f}"
+                ),
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=0.22,
+                debug_run=debug_run,
+                phase_name="submission_sfp_learned_teacher_step",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=0.10,
+                debug_run=debug_run,
+                phase_name="submission_sfp_learned_teacher_step_settle",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(
+                    next_observation.center_image.header.stamp
+                )
+                current_pose = self._observed_tcp_pose(next_observation, target_pose)
+            else:
+                current_pose = target_pose
+            prediction_records.append(
+                {
+                    "iteration_index": iteration_index,
+                    "raw_vector": [float(value) for value in raw_vector],
+                    "applied_translation_delta_base": [
+                        float(value) for value in translation_delta
+                    ],
+                    "applied_rotation_delta_rotvec_base": [
+                        float(value) for value in rotation_delta
+                    ],
+                    "feature_summary": current_feature_summary,
+                    "target_pose": _pose_to_dict(target_pose),
+                }
+            )
+            if float(np.linalg.norm(translation_delta)) < 0.003 and float(
+                np.linalg.norm(rotation_delta)
+            ) < 0.04:
+                break
+
+        return current_pose, current_observation, {"predictions": prediction_records}
+
+    def _run_sfp_submission_learned_coarse_to_fine(
+        self,
+        task: Task,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+    ) -> tuple[Pose | None, Observation | None, dict | None]:
+        visual_template = self._sfp_visual_template_for_task(task)
+        hover_uvz = self._learned_phase_template_uvz(
+            "sfp",
+            task,
+            "hover",
+            (
+                float(visual_template["union_center_uv"][0]),
+                float(visual_template["union_center_uv"][1]),
+                float(visual_template["camera_depth_m"]),
+            ),
+        )
+        mid_uvz = self._learned_phase_template_uvz(
+            "sfp",
+            task,
+            "insert_mid",
+            (
+                hover_uvz[0],
+                hover_uvz[1],
+                max(hover_uvz[2] - 0.030, 0.10),
+            ),
+        )
+        final_uvz = self._learned_phase_template_uvz(
+            "sfp",
+            task,
+            "insert_near",
+            (
+                mid_uvz[0],
+                mid_uvz[1],
+                max(mid_uvz[2] - 0.020, 0.08),
+            ),
+        )
+
+        hover_pose, hover_observation, hover_feature = self._run_sfp_submission_learned_servo(
+            task,
+            initial_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            desired_uv=(hover_uvz[0], hover_uvz[1]),
+            desired_depth_m=hover_uvz[2],
+            max_steps=16,
+            position_gain=0.80,
+            max_step_m=0.024,
+            align_tol_px=30.0,
+            depth_tol_m=0.025,
+            phase_name="submission_sfp_learned_hover",
+            settle_phase_name="submission_sfp_learned_hover_settle",
+        )
+        if hover_pose is None:
+            return None, hover_observation, {"hover_feature": hover_feature}
+
+        mid_input_observation = hover_observation if hover_observation is not None else initial_observation
+        mid_pose, mid_observation, mid_feature = self._run_sfp_submission_learned_servo(
+            task,
+            mid_input_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            desired_uv=(mid_uvz[0], mid_uvz[1]),
+            desired_depth_m=mid_uvz[2],
+            max_steps=14,
+            position_gain=0.76,
+            max_step_m=0.018,
+            align_tol_px=24.0,
+            depth_tol_m=0.018,
+            phase_name="submission_sfp_learned_mid",
+            settle_phase_name="submission_sfp_learned_mid_settle",
+        )
+        if mid_pose is None:
+            return hover_pose, hover_observation, {
+                "hover_feature": hover_feature,
+                "mid_feature": mid_feature,
+            }
+
+        fine_input_observation = mid_observation if mid_observation is not None else mid_input_observation
+        fine_pose, fine_observation, fine_feature = self._run_sfp_submission_learned_servo(
+            task,
+            fine_input_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            desired_uv=(final_uvz[0], final_uvz[1]),
+            desired_depth_m=final_uvz[2],
+            max_steps=12,
+            position_gain=0.70,
+            max_step_m=0.012,
+            align_tol_px=18.0,
+            depth_tol_m=0.010,
+            phase_name="submission_sfp_learned_final",
+            settle_phase_name="submission_sfp_learned_final_settle",
+        )
+        if fine_pose is None:
+            return mid_pose, mid_observation, {
+                "hover_feature": hover_feature,
+                "mid_feature": mid_feature,
+                "fine_feature": fine_feature,
+            }
+        return fine_pose, fine_observation, {
+            "hover_feature": hover_feature,
+            "mid_feature": mid_feature,
+            "fine_feature": fine_feature,
+        }
+
+    def _run_sfp_submission_learned_closed_loop_insertion(
+        self,
+        task: Task,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        push_schedule_m: tuple[float, ...] = (
+            0.0030,
+            0.0030,
+            0.0030,
+            0.0025,
+            0.0025,
+            0.0020,
+        ),
+        retreat_distance_m: float = 0.0015,
+    ) -> tuple[Pose, Observation | None, dict]:
+        visual_template = self._sfp_visual_template_for_task(task)
+        hover_uvz = self._learned_phase_template_uvz(
+            "sfp",
+            task,
+            "hover",
+            (
+                float(visual_template["union_center_uv"][0]),
+                float(visual_template["union_center_uv"][1]),
+                float(visual_template["camera_depth_m"]),
+            ),
+        )
+        mid_uvz = self._learned_phase_template_uvz(
+            "sfp",
+            task,
+            "insert_mid",
+            (
+                hover_uvz[0],
+                hover_uvz[1],
+                max(hover_uvz[2] - 0.030, 0.10),
+            ),
+        )
+        near_uvz = self._learned_phase_template_uvz(
+            "sfp",
+            task,
+            "insert_near",
+            (
+                mid_uvz[0],
+                mid_uvz[1],
+                max(mid_uvz[2] - 0.020, 0.08),
+            ),
+        )
+
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(
+            initial_observation,
+            initial_observation.controller_state.reference_tcp_pose,
+        )
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        baseline_force_norm = self._force_norm(initial_observation)
+        stalled_cycles = 0
+        cycle_records: list[dict[str, object]] = []
+
+        for cycle_index, push_distance_m in enumerate(push_schedule_m, start=1):
+            feature_before = self._sfp_learned_feature(task, current_observation)
+            if feature_before is None:
+                break
+
+            current_depth_m = float(feature_before["point_center_optical"][2])
+            if current_depth_m > near_uvz[2] + 0.020:
+                phase_label = "mid"
+                desired_uvz = mid_uvz
+                servo_kwargs = {
+                    "max_steps": 8,
+                    "position_gain": 0.68,
+                    "max_step_m": 0.010,
+                    "align_tol_px": 22.0,
+                    "depth_tol_m": 0.012,
+                }
+            else:
+                phase_label = "near"
+                desired_uvz = near_uvz
+                servo_kwargs = {
+                    "max_steps": 6,
+                    "position_gain": 0.60,
+                    "max_step_m": 0.008,
+                    "align_tol_px": 18.0,
+                    "depth_tol_m": 0.008,
+                }
+
+            aligned_pose, aligned_observation, aligned_feature = (
+                self._run_sfp_submission_learned_servo(
+                    task,
+                    current_observation
+                    if current_observation is not None
+                    else initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    desired_uv=(desired_uvz[0], desired_uvz[1]),
+                    desired_depth_m=desired_uvz[2],
+                    phase_name=f"submission_sfp_cycle_{cycle_index}_{phase_label}_servo",
+                    settle_phase_name=(
+                        f"submission_sfp_cycle_{cycle_index}_{phase_label}_settle"
+                    ),
+                    **servo_kwargs,
+                )
+            )
+            if aligned_observation is not None:
+                current_observation = aligned_observation
+            if aligned_pose is not None:
+                current_pose = self._observed_tcp_pose(current_observation, aligned_pose)
+
+            axis_base = self._tool_axis_in_base(current_pose, self._SFP_TOOL_INSERTION_AXIS)
+            axis_base /= max(np.linalg.norm(axis_base), 1e-6)
+            pre_push_position = self._pose_position(current_pose)
+            pushed_pose = self._run_tool_axis_push(
+                move_robot,
+                current_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=push_distance_m,
+                duration_sec=0.18,
+                hold_sec=0.12,
+                debug_run=debug_run,
+                phase_prefix=f"submission_sfp_cycle_{cycle_index}",
+            )
+            pushed_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.5,
+                newer_than_sec=last_stamp_sec,
+            )
+            if pushed_observation is not None:
+                current_observation = pushed_observation
+                last_stamp_sec = _stamp_to_float(
+                    pushed_observation.center_image.header.stamp
+                )
+            current_pose = self._observed_tcp_pose(current_observation, pushed_pose)
+
+            post_push_position = self._pose_position(current_pose)
+            actual_advance_m = float(np.dot(post_push_position - pre_push_position, axis_base))
+            tracking_error_m = None
+            measured_force_norm = None
+            excess_force_norm = None
+            if current_observation is not None:
+                tracking_error_m = float(
+                    np.linalg.norm(current_observation.controller_state.tcp_error[:3])
+                )
+                measured_force_norm = self._force_norm(current_observation)
+                excess_force_norm = measured_force_norm - baseline_force_norm
+
+            feature_after = self._sfp_learned_feature(task, current_observation)
+            depth_after_m = (
+                None
+                if feature_after is None
+                else float(feature_after["point_center_optical"][2])
+            )
+
+            cycle_record: dict[str, object] = {
+                "cycle_index": cycle_index,
+                "phase_label": phase_label,
+                "push_distance_m": float(push_distance_m),
+                "actual_advance_m": actual_advance_m,
+                "tracking_error_m": tracking_error_m,
+                "force_norm": measured_force_norm,
+                "excess_force_norm": excess_force_norm,
+                "depth_before_m": current_depth_m,
+                "depth_after_m": depth_after_m,
+                "aligned_feature": aligned_feature,
+                "feature_after": feature_after,
+                "pose": _pose_to_dict(current_pose),
+            }
+            cycle_records.append(cycle_record)
+            debug_run.log_phase(
+                f"submission_sfp_cycle_{cycle_index}_summary",
+                self.time_now().nanoseconds / 1e9,
+                (
+                    f"phase={phase_label} push={push_distance_m:.4f} "
+                    f"advance={actual_advance_m:.4f} "
+                    f"track={tracking_error_m if tracking_error_m is not None else float('nan'):.4f} "
+                    f"force={measured_force_norm if measured_force_norm is not None else float('nan'):.2f} "
+                    f"excess={excess_force_norm if excess_force_norm is not None else float('nan'):.2f} "
+                    f"depth_before={current_depth_m:.3f} "
+                    f"depth_after={depth_after_m if depth_after_m is not None else float('nan'):.3f}"
+                ),
+            )
+
+            stalled = actual_advance_m < 0.0010
+            overloaded = excess_force_norm is not None and excess_force_norm > 8.0
+            diverged = tracking_error_m is not None and tracking_error_m > 0.024
+            if stalled or overloaded or diverged:
+                stalled_cycles += 1
+                retreat_pose = self._run_tool_axis_push(
+                    move_robot,
+                    current_pose,
+                    self._SFP_TOOL_INSERTION_AXIS,
+                    push_distance_m=-retreat_distance_m,
+                    duration_sec=0.12,
+                    hold_sec=0.08,
+                    debug_run=debug_run,
+                    phase_prefix=f"submission_sfp_cycle_{cycle_index}_retreat",
+                )
+                retreat_observation = self._wait_for_observation(
+                    get_observation,
+                    timeout_sec=0.5,
+                    newer_than_sec=last_stamp_sec,
+                )
+                if retreat_observation is not None:
+                    current_observation = retreat_observation
+                    last_stamp_sec = _stamp_to_float(
+                        retreat_observation.center_image.header.stamp
+                    )
+                current_pose = self._observed_tcp_pose(current_observation, retreat_pose)
+            else:
+                stalled_cycles = 0
+
+            if stalled_cycles >= 2:
+                break
+
+        return current_pose, current_observation, {"cycles": cycle_records}
 
     def _run_sc_submission_servo(
         self,
@@ -1868,7 +3196,12 @@ class QualPhasePilot(Policy):
         phase_name: str = "submission_sc_learned_servo",
         settle_phase_name: str = "submission_sc_learned_settle",
     ) -> tuple[Pose | None, Observation | None, dict | None]:
-        learned_feature = self._sc_learned_feature(task, initial_observation)
+        learned_feature = self._sc_learned_feature(
+            task,
+            initial_observation,
+            step_index=1,
+            max_steps=max_steps,
+        )
         if learned_feature is None:
             return None, initial_observation, None
 
@@ -1886,7 +3219,12 @@ class QualPhasePilot(Policy):
         best_feature = learned_feature
 
         for step in range(max_steps):
-            learned_feature = self._sc_learned_feature(task, observation)
+            learned_feature = self._sc_learned_feature(
+                task,
+                observation,
+                step_index=step + 1,
+                max_steps=max_steps,
+            )
             if learned_feature is None:
                 break
             best_feature = learned_feature
@@ -2377,7 +3715,7 @@ class QualPhasePilot(Policy):
                     self.time_now().nanoseconds / 1e9,
                     note=f"hover step {step}/80",
                 )
-            self.sleep_for(0.05)
+            self._wait_for_sim_progress(0.05)
             if step % 5 != 0:
                 continue
             observation = self._wait_for_observation(
@@ -2435,7 +3773,7 @@ class QualPhasePilot(Policy):
                     self.time_now().nanoseconds / 1e9,
                     note=f"insert step {step + 1}/90 z_offset={z_offset:.4f}",
                 )
-            self.sleep_for(0.05)
+            self._wait_for_sim_progress(0.05)
             if step % 4 != 0:
                 continue
             observation = self._wait_for_observation(
@@ -2477,6 +3815,902 @@ class QualPhasePilot(Policy):
             {"feature_summary": self._extract_feature_summary(task, final_observation)},
         )
         self.get_logger().info(f"learn_collect_v1 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_learn_collect_v2(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        port_frame = self._port_frame_name(task)
+
+        self._capture_gt_port_sample(
+            task,
+            initial_observation,
+            phase="initial",
+            extra={
+                "feature_summary": self._extract_feature_summary(task, initial_observation),
+                "teacher_mode": "gt_teacher_v2",
+            },
+        )
+        self._collect_learning_pose_sweep(
+            task,
+            get_observation,
+            move_robot,
+            initial_observation,
+            phase_prefix="initial",
+            debug_run=debug_run,
+        )
+
+        teacher_anchors = [
+            ("teacher_hover", 0.16 if task.plug_type == "sfp" else 0.18),
+            ("teacher_insert", 0.08 if task.plug_type == "sfp" else 0.11),
+        ]
+        current_observation = initial_observation
+
+        send_feedback("learn_collect_v2: sweeping around GT teacher anchors")
+        for phase_name, z_offset in teacher_anchors:
+            target_pose = self._gt_teacher_gripper_pose(
+                task,
+                port_frame,
+                slerp_fraction=1.0,
+                position_fraction=1.0,
+                z_offset=z_offset,
+                reset_xy_integrator=(phase_name == "teacher_hover"),
+            )
+            if target_pose is None:
+                debug_run.finalize(
+                    False, f"gt teacher pose unavailable during {phase_name}", initial_observation
+                )
+                return False
+            start_pose = (
+                current_observation.controller_state.tcp_pose
+                if current_observation is not None
+                else initial_observation.controller_state.tcp_pose
+            )
+            self._move_for_duration(
+                move_robot,
+                start_pose,
+                target_pose,
+                duration_sec=0.40 if task.plug_type == "sfp" else 0.45,
+                debug_run=debug_run,
+                phase_name=f"{phase_name}_anchor_move",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=0.20,
+                debug_run=debug_run,
+                phase_name=f"{phase_name}_anchor_settle",
+            )
+            current_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+            )
+            self._capture_gt_port_sample(
+                task,
+                current_observation,
+                phase=phase_name,
+                extra={
+                    "teacher_z_offset": float(z_offset),
+                    "teacher_pose": _pose_to_dict(target_pose),
+                    "feature_summary": self._extract_feature_summary(task, current_observation),
+                },
+            )
+            debug_run.save_observation_snapshot(
+                phase_name,
+                current_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, current_observation),
+                    "teacher_pose": _pose_to_dict(target_pose),
+                },
+            )
+            self._collect_learning_pose_sweep(
+                task,
+                get_observation,
+                move_robot,
+                current_observation,
+                phase_prefix=phase_name,
+                debug_run=debug_run,
+            )
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=1.0)
+        debug_run.save_observation_snapshot(
+            "teacher_insert_final",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        debug_run.finalize(
+            True,
+            "learn_collect_v2 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"learn_collect_v2 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_learn_collect_sfp_insert_v0(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        if task.plug_type != "sfp":
+            return self._run_stage_learn_collect_v2(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        send_feedback("learn_collect_sfp_insert_v0: collecting GT teacher_insert sweeps")
+        port_frame = self._port_frame_name(task)
+        teacher_insert_pose = self._gt_teacher_gripper_pose(
+            task,
+            port_frame,
+            slerp_fraction=1.0,
+            position_fraction=1.0,
+            z_offset=0.08,
+            reset_xy_integrator=True,
+        )
+        if teacher_insert_pose is None:
+            debug_run.finalize(False, "gt teacher insert pose unavailable", initial_observation)
+            return False
+
+        self._move_for_duration(
+            move_robot,
+            initial_observation.controller_state.tcp_pose,
+            teacher_insert_pose,
+            duration_sec=0.35,
+            debug_run=debug_run,
+            phase_name="teacher_insert_anchor_move",
+        )
+        self._hold_pose(
+            move_robot,
+            teacher_insert_pose,
+            duration_sec=0.16,
+            debug_run=debug_run,
+            phase_name="teacher_insert_anchor_settle",
+        )
+        teacher_observation = self._wait_for_observation(
+            get_observation,
+            timeout_sec=0.8,
+        )
+        self._capture_gt_port_sample(
+            task,
+            teacher_observation,
+            phase="teacher_insert",
+            extra={
+                "teacher_pose": _pose_to_dict(teacher_insert_pose),
+                "teacher_z_offset": 0.08,
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+            },
+        )
+        debug_run.save_observation_snapshot(
+            "teacher_insert",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_pose": _pose_to_dict(teacher_insert_pose),
+            },
+        )
+        self._collect_learning_pose_sweep(
+            task,
+            get_observation,
+            move_robot,
+            teacher_observation,
+            phase_prefix="teacher_insert",
+            debug_run=debug_run,
+        )
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=1.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        debug_run.finalize(
+            True,
+            "learn_collect_sfp_insert_v0 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(
+            f"learn_collect_sfp_insert_v0 artifacts saved to {debug_run.root}"
+        )
+        return True
+
+    def _run_stage_learn_collect_sfp_servo_residual_v0(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        if task.plug_type != "sfp":
+            return self._run_stage_learn_collect_v2(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        send_feedback(
+            "learn_collect_sfp_servo_residual_v0: collecting GT labels from the legal SFP servo state"
+        )
+        aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+            initial_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        debug_run.save_observation_snapshot(
+            "after_legal_servo",
+            aligned_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, aligned_observation),
+                "feature": aligned_feature,
+                "aligned_pose": None if aligned_pose is None else _pose_to_dict(aligned_pose),
+            },
+        )
+        if aligned_observation is None:
+            debug_run.finalize(
+                False,
+                "learn_collect_sfp_servo_residual_v0 failed to get post-servo observation",
+                initial_observation,
+            )
+            return False
+
+        self._capture_gt_port_sample(
+            task,
+            aligned_observation,
+            phase="post_legal_servo",
+            extra={
+                "feature": aligned_feature,
+                "feature_summary": self._extract_feature_summary(task, aligned_observation),
+                "aligned_pose": None if aligned_pose is None else _pose_to_dict(aligned_pose),
+            },
+        )
+        self._collect_learning_pose_sweep(
+            task,
+            get_observation,
+            move_robot,
+            aligned_observation,
+            phase_prefix="post_legal_servo",
+            debug_run=debug_run,
+        )
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=1.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        debug_run.finalize(
+            True,
+            "learn_collect_sfp_servo_residual_v0 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(
+            f"learn_collect_sfp_servo_residual_v0 artifacts saved to {debug_run.root}"
+        )
+        return True
+
+    def _run_stage_learn_collect_sfp_teacher_step_v0(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        if task.plug_type != "sfp":
+            return self._run_stage_learn_collect_v2(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        send_feedback(
+            "learn_collect_sfp_teacher_step_v0: collecting small GT teacher steps from the legal SFP servo state"
+        )
+        aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+            initial_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        debug_run.save_observation_snapshot(
+            "after_legal_servo",
+            aligned_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, aligned_observation),
+                "feature": aligned_feature,
+                "aligned_pose": None if aligned_pose is None else _pose_to_dict(aligned_pose),
+            },
+        )
+        if aligned_pose is None or aligned_observation is None:
+            debug_run.finalize(
+                False,
+                "learn_collect_sfp_teacher_step_v0 failed to get post-servo observation",
+                initial_observation,
+            )
+            return False
+
+        teacher_insert_pose = self._gt_teacher_gripper_pose(
+            task,
+            self._port_frame_name(task),
+            slerp_fraction=1.0,
+            position_fraction=1.0,
+            z_offset=0.08,
+            reset_xy_integrator=True,
+        )
+        if teacher_insert_pose is None:
+            debug_run.finalize(
+                False,
+                "learn_collect_sfp_teacher_step_v0 teacher insert pose unavailable",
+                aligned_observation,
+            )
+            return False
+
+        current_observation: Observation | None = aligned_observation
+        current_pose = self._observed_tcp_pose(aligned_observation, aligned_pose)
+        last_stamp_sec = _stamp_to_float(aligned_observation.center_image.header.stamp)
+        max_teacher_steps = 8
+
+        for step_index in range(max_teacher_steps):
+            current_pose = self._observed_tcp_pose(current_observation, current_pose)
+            remaining_translation_delta, remaining_rotation_delta = self._pose_delta_base(
+                current_pose,
+                teacher_insert_pose,
+            )
+            if float(np.linalg.norm(remaining_translation_delta)) < 0.003 and float(
+                np.linalg.norm(remaining_rotation_delta)
+            ) < 0.05:
+                break
+            applied_translation_delta, applied_rotation_delta = (
+                self._clamp_sfp_teacher_step_delta(
+                    remaining_translation_delta,
+                    remaining_rotation_delta,
+                )
+            )
+            next_pose = self._apply_pose_residual_base(
+                current_pose,
+                translation_delta_base=applied_translation_delta,
+                rotation_delta_rotvec_base=applied_rotation_delta,
+            )
+            self._capture_gt_port_sample(
+                task,
+                current_observation,
+                phase="post_legal_servo_teacher_step",
+                extra={
+                    "teacher_step_index": int(step_index + 1),
+                    "remaining_translation_norm_m": float(
+                        np.linalg.norm(remaining_translation_delta)
+                    ),
+                    "remaining_rotation_norm_rad": float(
+                        np.linalg.norm(remaining_rotation_delta)
+                    ),
+                    "applied_translation_delta_base": [
+                        float(value) for value in applied_translation_delta
+                    ],
+                    "applied_rotation_delta_rotvec_base": [
+                        float(value) for value in applied_rotation_delta
+                    ],
+                    "feature_summary": self._extract_feature_summary(
+                        task, current_observation
+                    ),
+                },
+                label_overrides={"teacher_step_pose": _pose_to_dict(next_pose)},
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                next_pose,
+                duration_sec=0.20,
+                debug_run=debug_run,
+                phase_name=f"teacher_step_move_{step_index + 1}",
+            )
+            self._hold_pose(
+                move_robot,
+                next_pose,
+                duration_sec=0.08,
+                debug_run=debug_run,
+                phase_name=f"teacher_step_settle_{step_index + 1}",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is None:
+                current_pose = next_pose
+                current_observation = current_observation
+                continue
+            current_observation = next_observation
+            last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+            current_pose = self._observed_tcp_pose(next_observation, next_pose)
+
+        final_observation = self._wait_for_observation(
+            get_observation,
+            timeout_sec=1.0,
+            newer_than_sec=last_stamp_sec,
+        )
+        if final_observation is None:
+            final_observation = current_observation
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        debug_run.finalize(
+            True,
+            "learn_collect_sfp_teacher_step_v0 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(
+            f"learn_collect_sfp_teacher_step_v0 artifacts saved to {debug_run.root}"
+        )
+        return True
+
+    def _run_sfp_gt_teacher_insert(
+        self,
+        task: Task,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+    ) -> tuple[Pose | None, Observation | None, dict[str, object]]:
+        port_frame = self._port_frame_name(task)
+        current_observation: Observation | None = initial_observation
+        current_pose = self._observed_tcp_pose(
+            initial_observation,
+            initial_observation.controller_state.reference_tcp_pose,
+        )
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        phase_records: list[dict[str, object]] = []
+        teacher_schedule = (
+            ("teacher_hover", 0.16, 0.38, 0.14),
+            ("teacher_preinsert_far", 0.10, 0.28, 0.10),
+            ("teacher_preinsert_mid", 0.06, 0.24, 0.10),
+            ("teacher_preinsert_near", 0.04, 0.20, 0.08),
+            ("teacher_insert_1", 0.025, 0.18, 0.08),
+            ("teacher_insert_2", 0.015, 0.16, 0.08),
+            ("teacher_insert_3", 0.008, 0.14, 0.08),
+            ("teacher_insert_4", 0.003, 0.12, 0.10),
+        )
+
+        for phase_index, (phase_name, z_offset, move_sec, hold_sec) in enumerate(
+            teacher_schedule, start=1
+        ):
+            target_pose = self._gt_teacher_gripper_pose(
+                task,
+                port_frame,
+                slerp_fraction=1.0,
+                position_fraction=1.0,
+                z_offset=z_offset,
+                reset_xy_integrator=(phase_index == 1),
+            )
+            if target_pose is None:
+                return None, current_observation, {
+                    "phase_records": phase_records,
+                    "failed_phase": phase_name,
+                    "message": "gt teacher pose unavailable",
+                }
+
+            remaining_translation_delta, remaining_rotation_delta = self._pose_delta_base(
+                current_pose,
+                target_pose,
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=move_sec,
+                debug_run=debug_run,
+                phase_name=f"{phase_name}_move",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=hold_sec,
+                debug_run=debug_run,
+                phase_name=f"{phase_name}_settle",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                current_pose = self._observed_tcp_pose(next_observation, target_pose)
+            else:
+                current_pose = target_pose
+
+            phase_records.append(
+                {
+                    "phase_name": phase_name,
+                    "z_offset": float(z_offset),
+                    "move_duration_sec": float(move_sec),
+                    "hold_duration_sec": float(hold_sec),
+                    "remaining_translation_norm_m": float(
+                        np.linalg.norm(remaining_translation_delta)
+                    ),
+                    "remaining_rotation_norm_rad": float(
+                        np.linalg.norm(remaining_rotation_delta)
+                    ),
+                    "target_pose": _pose_to_dict(target_pose),
+                }
+            )
+
+        return current_pose, current_observation, {
+            "port_frame": port_frame,
+            "phase_records": phase_records,
+        }
+
+    def _run_sfp_gt_teacher_terminal_insert(
+        self,
+        task: Task,
+        initial_pose: Pose,
+        initial_observation: Observation,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+    ) -> tuple[Pose, Observation | None, dict[str, object]]:
+        current_pose = initial_pose
+        current_observation: Observation | None = initial_observation
+        last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
+        phase_records: list[dict[str, object]] = []
+        contact_schedule = (
+            ("teacher_contact_1", 0.0015, 0.12, 0.12),
+            ("teacher_contact_2", 0.0, 0.12, 0.14),
+            ("teacher_contact_3", -0.0015, 0.12, 0.16),
+            ("teacher_contact_4", -0.003, 0.12, 0.18),
+        )
+
+        for phase_name, z_offset, move_sec, hold_sec in contact_schedule:
+            target_pose = self._gt_teacher_gripper_pose(
+                task,
+                self._port_frame_name(task),
+                slerp_fraction=1.0,
+                position_fraction=1.0,
+                z_offset=z_offset,
+            )
+            if target_pose is None:
+                break
+            remaining_translation_delta, remaining_rotation_delta = self._pose_delta_base(
+                current_pose,
+                target_pose,
+            )
+            self._move_for_duration(
+                move_robot,
+                current_pose,
+                target_pose,
+                duration_sec=move_sec,
+                debug_run=debug_run,
+                phase_name=f"{phase_name}_move",
+            )
+            self._hold_pose(
+                move_robot,
+                target_pose,
+                duration_sec=hold_sec,
+                debug_run=debug_run,
+                phase_name=f"{phase_name}_settle",
+            )
+            next_observation = self._wait_for_observation(
+                get_observation,
+                timeout_sec=0.8,
+                newer_than_sec=last_stamp_sec,
+            )
+            if next_observation is not None:
+                current_observation = next_observation
+                last_stamp_sec = _stamp_to_float(next_observation.center_image.header.stamp)
+                current_pose = self._observed_tcp_pose(next_observation, target_pose)
+            else:
+                current_pose = target_pose
+            phase_records.append(
+                {
+                    "phase_name": phase_name,
+                    "z_offset": float(z_offset),
+                    "move_duration_sec": float(move_sec),
+                    "hold_duration_sec": float(hold_sec),
+                    "remaining_translation_norm_m": float(
+                        np.linalg.norm(remaining_translation_delta)
+                    ),
+                    "remaining_rotation_norm_rad": float(
+                        np.linalg.norm(remaining_rotation_delta)
+                    ),
+                    "target_pose": _pose_to_dict(target_pose),
+                }
+            )
+
+        return current_pose, current_observation, {"phase_records": phase_records}
+
+    def _run_stage_teacher_feasibility_v0(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v0 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "Success criterion is insertion-led randomized SFP score, not proximity polish",
+                ],
+            }
+        )
+
+        send_feedback("teacher_feasibility_v0: GT teacher approach + bounded terminal push")
+        teacher_pose, teacher_observation, teacher_metadata = self._run_sfp_gt_teacher_insert(
+            task,
+            initial_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_teacher",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v0 teacher approach failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        terminal_pose, terminal_observation, terminal_metadata = (
+            self._run_sfp_gt_teacher_terminal_insert(
+                task,
+                teacher_pose,
+                teacher_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+        )
+        debug_run.save_observation_snapshot(
+            "after_teacher_terminal",
+            terminal_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, terminal_observation),
+                "teacher_pose": _pose_to_dict(terminal_pose),
+                "terminal_metadata": terminal_metadata,
+            },
+        )
+
+        final_pose, final_observation, insertion_feature = self._run_sfp_incremental_insertion(
+            terminal_observation if terminal_observation is not None else teacher_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            aligned_feature=None,
+            push_schedule_m=(0.0015, 0.0015, 0.001, 0.001),
+        )
+        debug_run.save_observation_snapshot(
+            "after_teacher_insertion",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "feature": insertion_feature,
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+                "terminal_metadata": terminal_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v0 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v0 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v17(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "learned_sfp_model_dir": self._learned_sfp_model_dir,
+                "notes": [
+                    "SFP path reuses the stable submission_safe_v6 legal servo timing",
+                    "SFP then runs a learned closed-loop small-step policy trained from GT teacher trajectory snippets",
+                    "SC path matches submission_safe_v6",
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback(
+                "submission_v17: SFP legal servo + learned teacher-step closed loop"
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None or aligned_observation is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v17 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            learned_pose, learned_observation, learned_metadata = (
+                self._run_sfp_submission_learned_teacher_step_policy(
+                    task,
+                    aligned_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_learned_teacher_step",
+                learned_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(
+                        task, learned_observation
+                    ),
+                    "feature": self._sfp_union_feature(learned_observation),
+                    "learned_metadata": learned_metadata,
+                    "learned_pose": None if learned_pose is None else _pose_to_dict(learned_pose),
+                },
+            )
+            if learned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v17 learned teacher-step policy unavailable",
+                    learned_observation,
+                    {"learned_metadata": learned_metadata},
+                )
+                return False
+
+            final_pose, final_observation, insertion_feature = (
+                self._run_sfp_incremental_insertion(
+                    learned_observation
+                    if learned_observation is not None
+                    else aligned_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    aligned_feature,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_insertion_cycles",
+                final_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, final_observation),
+                    "feature": insertion_feature,
+                    "final_pose": _pose_to_dict(final_pose),
+                },
+            )
+        else:
+            return self._run_stage_submission_safe_v6(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        debug_run.finalize(
+            True,
+            "submission_safe_v17 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v17 artifacts saved to {debug_run.root}")
         return True
 
     def _run_stage_submission_safe_v3(
@@ -3422,6 +5656,1144 @@ class QualPhasePilot(Policy):
         self.get_logger().info(f"submission_safe_v8 artifacts saved to {debug_run.root}")
         return True
 
+    def _run_stage_submission_safe_v9(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "learned_model_dir": self._learned_model_dir,
+                "notes": [
+                    "SFP path replaces single blind push with observed-pose closed-loop insertion cycles",
+                    "bag analysis showed the submission_safe_v6 SFP blind push could leave multi-centimeter tracking error",
+                    "SC path matches submission_safe_v6",
+                    (
+                        "SC force refine and residual stages are enabled"
+                        if self._enable_sc_refinement
+                        else "SC refinement is disabled for fail-fast isolation"
+                    ),
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback("submission_v9: SFP closed-loop insertion")
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v9 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+            final_pose, final_observation, insertion_feature = self._run_sfp_closed_loop_insertion(
+                aligned_observation if aligned_observation is not None else initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_insertion_cycles",
+                final_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, final_observation),
+                    "feature": insertion_feature,
+                    "final_pose": _pose_to_dict(final_pose),
+                },
+            )
+        else:
+            if self._learned_port_inference_or_none() is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v9 requires AIC_QUAL_LEARNED_SC_MODEL_DIR",
+                    initial_observation,
+                )
+                return False
+            send_feedback("submission_v9: SC learned multi-view translation servo")
+            aligned_pose, aligned_observation, aligned_feature = (
+                self._run_sc_submission_learned_coarse_to_fine(
+                    task,
+                    initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v9 SC learned servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            baseline_force_norm = self._force_norm(initial_observation)
+            pushed_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SC_TOOL_INSERTION_AXIS,
+                push_distance_m=0.004,
+                duration_sec=0.35,
+                hold_sec=0.25,
+                debug_run=debug_run,
+                phase_prefix="submission_sc",
+            )
+            if self._enable_sc_refinement:
+                refined_pose = self._run_sc_force_refine(
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    start_pose=pushed_pose,
+                    baseline_force_norm=baseline_force_norm,
+                )
+                refined_observation = self._wait_for_observation(
+                    get_observation, timeout_sec=0.8
+                )
+                debug_run.save_observation_snapshot(
+                    "after_force_refine",
+                    refined_observation,
+                    {
+                        "feature_summary": self._extract_feature_summary(
+                            task, refined_observation
+                        ),
+                        "feature": self._sc_learned_feature(task, refined_observation),
+                        "refined_pose": _pose_to_dict(refined_pose),
+                    },
+                )
+                final_pose = self._run_sc_visual_residual(
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    refined_pose,
+                    baseline_force_norm=baseline_force_norm,
+                )
+            else:
+                pushed_observation = self._wait_for_observation(
+                    get_observation,
+                    timeout_sec=0.8,
+                )
+                debug_run.save_observation_snapshot(
+                    "after_push",
+                    pushed_observation,
+                    {
+                        "feature_summary": self._extract_feature_summary(
+                            task, pushed_observation
+                        ),
+                        "feature": self._sc_learned_feature(task, pushed_observation),
+                        "pushed_pose": _pose_to_dict(pushed_pose),
+                    },
+                )
+                final_pose = pushed_pose
+            final_observation = self._wait_for_observation(get_observation, timeout_sec=2.0)
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=2.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+            },
+        )
+        debug_run.finalize(
+            True,
+            "submission_safe_v9 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v9 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v10(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "learned_model_dir": self._learned_model_dir,
+                "notes": [
+                    "SFP path uses one legal servo pass followed by observed-tcp incremental insertion cycles",
+                    "cycle timing is shortened for fail-fast debugging",
+                    "mini recentering runs only when SFP image drift exceeds threshold",
+                    "SC path matches submission_safe_v6",
+                    (
+                        "SC force refine and residual stages are enabled"
+                        if self._enable_sc_refinement
+                        else "SC refinement is disabled for fail-fast isolation"
+                    ),
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback("submission_v10: SFP incremental insertion")
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                max_steps=12,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v10 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+            final_pose, final_observation, insertion_feature = (
+                self._run_sfp_incremental_insertion(
+                    aligned_observation if aligned_observation is not None else initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    aligned_feature,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_insertion_cycles",
+                final_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, final_observation),
+                    "feature": insertion_feature,
+                    "final_pose": _pose_to_dict(final_pose),
+                },
+            )
+        else:
+            return self._run_stage_submission_safe_v6(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=2.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+            },
+        )
+        debug_run.finalize(
+            True,
+            "submission_safe_v10 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v10 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v11(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "learned_sc_model_dir": self._learned_sc_model_dir,
+                "learned_sfp_model_dir": self._learned_sfp_model_dir,
+                "notes": [
+                    "SFP path replaces green-mask legal servo with learned multi-view center_uvz acquisition",
+                    "SFP insertion keeps the proven tool-axis push primitive from submission_safe_v6",
+                    "SC path matches submission_safe_v6",
+                    (
+                        "SC force refine and residual stages are enabled"
+                        if self._enable_sc_refinement
+                        else "SC refinement is disabled for fail-fast isolation of learned target acquisition"
+                    ),
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            if self._learned_port_inference_or_none("sfp") is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v11 requires AIC_QUAL_LEARNED_SFP_MODEL_DIR",
+                    initial_observation,
+                )
+                return False
+            send_feedback("submission_v11: SFP learned multi-view acquisition")
+            aligned_pose, aligned_observation, aligned_feature = (
+                self._run_sfp_submission_learned_coarse_to_fine(
+                    task,
+                    initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v11 SFP learned servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+            final_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SFP_TOOL_INSERTION_AXIS,
+                push_distance_m=0.012,
+                duration_sec=0.45,
+                hold_sec=0.8,
+                debug_run=debug_run,
+                phase_prefix="submission_sfp",
+            )
+            pushed_observation = self._wait_for_observation(get_observation, timeout_sec=0.8)
+            debug_run.save_observation_snapshot(
+                "after_push",
+                pushed_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, pushed_observation),
+                    "feature": self._sfp_learned_feature(task, pushed_observation),
+                    "pushed_pose": _pose_to_dict(final_pose),
+                },
+            )
+        else:
+            if self._learned_port_inference_or_none("sc") is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v11 requires AIC_QUAL_LEARNED_SC_MODEL_DIR",
+                    initial_observation,
+                )
+                return False
+            send_feedback("submission_v11: SC learned multi-view translation servo")
+            debug_run.log_phase(
+                "acquire_target",
+                self.time_now().nanoseconds / 1e9,
+                "running learned SC translation-only servo using current observation",
+            )
+            aligned_pose, aligned_observation, aligned_feature = (
+                self._run_sc_submission_learned_coarse_to_fine(
+                    task,
+                    initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v11 SC learned servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            baseline_force_norm = self._force_norm(initial_observation)
+            pushed_pose = self._run_tool_axis_push(
+                move_robot,
+                aligned_pose,
+                self._SC_TOOL_INSERTION_AXIS,
+                push_distance_m=0.004,
+                duration_sec=0.35,
+                hold_sec=0.25,
+                debug_run=debug_run,
+                phase_prefix="submission_sc",
+            )
+            if self._enable_sc_refinement:
+                refined_pose = self._run_sc_force_refine(
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    start_pose=pushed_pose,
+                    baseline_force_norm=baseline_force_norm,
+                )
+                refined_observation = self._wait_for_observation(
+                    get_observation, timeout_sec=0.8
+                )
+                debug_run.save_observation_snapshot(
+                    "after_force_refine",
+                    refined_observation,
+                    {
+                        "feature_summary": self._extract_feature_summary(
+                            task, refined_observation
+                        ),
+                        "feature": self._sc_learned_feature(task, refined_observation),
+                        "refined_pose": _pose_to_dict(refined_pose),
+                    },
+                )
+                final_pose = self._run_sc_visual_residual(
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    refined_pose,
+                    baseline_force_norm=baseline_force_norm,
+                )
+            else:
+                pushed_observation = self._wait_for_observation(
+                    get_observation, timeout_sec=0.8
+                )
+                debug_run.save_observation_snapshot(
+                    "after_push",
+                    pushed_observation,
+                    {
+                        "feature_summary": self._extract_feature_summary(
+                            task, pushed_observation
+                        ),
+                        "feature": self._sc_learned_feature(task, pushed_observation),
+                        "pushed_pose": _pose_to_dict(pushed_pose),
+                    },
+                )
+                final_pose = pushed_pose
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=1.0)
+        debug_run.finalize(
+            True,
+            "submission_safe_v11 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v11 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v12(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "learned_sc_model_dir": self._learned_sc_model_dir,
+                "learned_sfp_model_dir": self._learned_sfp_model_dir,
+                "notes": [
+                    "SFP path uses learned multi-view acquisition followed by visual reacquire plus bounded insertion cycles",
+                    "SFP insertion retreats on stall, force overload, or tracking divergence instead of holding a blind push",
+                    "SC path matches submission_safe_v11",
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            if self._learned_port_inference_or_none("sfp") is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v12 requires AIC_QUAL_LEARNED_SFP_MODEL_DIR",
+                    initial_observation,
+                )
+                return False
+            send_feedback("submission_v12: SFP learned acquisition + closed-loop insertion")
+            aligned_pose, aligned_observation, aligned_feature = (
+                self._run_sfp_submission_learned_coarse_to_fine(
+                    task,
+                    initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v12 SFP learned servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+            final_pose, final_observation, insertion_feature = (
+                self._run_sfp_submission_learned_closed_loop_insertion(
+                    task,
+                    aligned_observation if aligned_observation is not None else initial_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_insertion_cycles",
+                final_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, final_observation),
+                    "feature": insertion_feature,
+                    "final_pose": _pose_to_dict(final_pose),
+                },
+            )
+        else:
+            return self._run_stage_submission_safe_v11(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=1.0)
+        debug_run.finalize(
+            True,
+            "submission_safe_v12 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v12 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v13(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "learned_model_dir": self._learned_model_dir,
+                "notes": [
+                    "SFP path keeps the stable center-camera legal servo from submission_safe_v6",
+                    "SFP insertion replaces the blind push with a bounded tool-frame hole-finding search",
+                    "SC path matches submission_safe_v6",
+                    (
+                        "SC force refine and residual stages are enabled"
+                        if self._enable_sc_refinement
+                        else "SC refinement is disabled for fail-fast isolation of SFP insertion changes"
+                    ),
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback("submission_v13: SFP legal servo + tool-frame insertion search")
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.log_phase(
+                "after_legal_servo",
+                self.time_now().nanoseconds / 1e9,
+                note="submission_safe_v13 SFP legal servo completed",
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v13 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+            baseline_force_norm = self._force_norm(initial_observation)
+            debug_run.log_phase(
+                "before_insertion_search",
+                self.time_now().nanoseconds / 1e9,
+                note=f"baseline_force_norm={baseline_force_norm:.3f}",
+            )
+            final_pose = self._run_sfp_force_refine_tool_frame(
+                get_observation,
+                move_robot,
+                debug_run,
+                start_pose=aligned_pose,
+                baseline_force_norm=baseline_force_norm,
+            )
+            debug_run.log_phase(
+                "after_insertion_search",
+                self.time_now().nanoseconds / 1e9,
+                note="submission_safe_v13 SFP insertion search completed",
+            )
+            refined_observation = self._wait_for_observation(
+                get_observation, timeout_sec=0.8
+            )
+            debug_run.save_observation_snapshot(
+                "after_insertion_search",
+                refined_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(
+                        task, refined_observation
+                    ),
+                    "feature": self._sfp_union_feature(refined_observation),
+                    "refined_pose": _pose_to_dict(final_pose),
+                },
+            )
+        else:
+            return self._run_stage_submission_safe_v6(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        debug_run.log_phase(
+            "before_final_wait",
+            self.time_now().nanoseconds / 1e9,
+            note="waiting for final observation",
+        )
+        final_observation = self._wait_for_observation(get_observation, timeout_sec=2.0)
+        debug_run.save_observation_snapshot(
+            "final",
+            final_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, final_observation),
+                "final_pose": _pose_to_dict(final_pose),
+            },
+        )
+        debug_run.log_phase(
+            "after_final_snapshot",
+            self.time_now().nanoseconds / 1e9,
+            note="final observation snapshot saved",
+        )
+        debug_run.finalize(
+            True,
+            "submission_safe_v13 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v13 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v14(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "learned_sc_model_dir": self._learned_sc_model_dir,
+                "learned_sfp_model_dir": self._learned_sfp_model_dir,
+                "notes": [
+                    "SFP path uses the stable legal servo from submission_safe_v6",
+                    "A learned teacher-insert residual corrects the near-port SFP pose before insertion",
+                    "SFP insertion then uses bounded incremental pushes",
+                    "SC path matches submission_safe_v6",
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback("submission_v14: SFP legal servo + learned insert residual")
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+                max_steps=12,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None or aligned_observation is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v14 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+            residual_pose, residual_observation, residual_metadata = (
+                self._run_sfp_submission_learned_teacher_insert_residual(
+                    task,
+                    aligned_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_learned_residual",
+                residual_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(
+                        task, residual_observation
+                    ),
+                    "feature": self._sfp_union_feature(residual_observation),
+                    "residual_metadata": residual_metadata,
+                    "residual_pose": _pose_to_dict(residual_pose),
+                },
+            )
+            if residual_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v14 learned residual unavailable",
+                    residual_observation,
+                    {"residual_metadata": residual_metadata},
+                )
+                return False
+            final_pose, final_observation, insertion_feature = (
+                self._run_sfp_incremental_insertion(
+                    residual_observation
+                    if residual_observation is not None
+                    else aligned_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    aligned_feature,
+                )
+            )
+            debug_run.log_phase(
+                "before_after_insertion_snapshot",
+                self.time_now().nanoseconds / 1e9,
+                note="saving after_insertion_cycles snapshot",
+            )
+            debug_run.save_observation_snapshot(
+                "after_insertion_cycles",
+                final_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, final_observation),
+                    "feature": insertion_feature,
+                    "final_pose": _pose_to_dict(final_pose),
+                },
+            )
+            debug_run.log_phase(
+                "after_after_insertion_snapshot",
+                self.time_now().nanoseconds / 1e9,
+                note="after_insertion_cycles snapshot saved",
+            )
+        else:
+            return self._run_stage_submission_safe_v6(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        debug_run.log_phase(
+            "before_finalize",
+            self.time_now().nanoseconds / 1e9,
+            note="finalizing with latest insertion observation",
+        )
+        debug_run.finalize(
+            True,
+            "submission_safe_v14 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v14 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v15(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "learned_sc_model_dir": self._learned_sc_model_dir,
+                "learned_sfp_model_dir": self._learned_sfp_model_dir,
+                "notes": [
+                    "SFP path reuses the stable submission_safe_v6 legal servo timing",
+                    "SFP learned residual is trained from post-legal-servo GT labels to reduce train-deployment mismatch",
+                    "SFP applies a single residual step before bounded incremental pushes",
+                    "SC path matches submission_safe_v6",
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback(
+                "submission_v15: SFP v6 legal servo + post-servo learned residual"
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None or aligned_observation is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v15 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+            residual_pose, residual_observation, residual_metadata = (
+                self._run_sfp_submission_learned_teacher_insert_residual(
+                    task,
+                    aligned_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    max_iterations=1,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_learned_residual",
+                residual_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(
+                        task, residual_observation
+                    ),
+                    "feature": self._sfp_union_feature(residual_observation),
+                    "residual_metadata": residual_metadata,
+                    "residual_pose": _pose_to_dict(residual_pose),
+                },
+            )
+            if residual_pose is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v15 learned residual unavailable",
+                    residual_observation,
+                    {"residual_metadata": residual_metadata},
+                )
+                return False
+            final_pose, final_observation, insertion_feature = (
+                self._run_sfp_incremental_insertion(
+                    residual_observation
+                    if residual_observation is not None
+                    else aligned_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    aligned_feature,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_insertion_cycles",
+                final_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, final_observation),
+                    "feature": insertion_feature,
+                    "final_pose": _pose_to_dict(final_pose),
+                },
+            )
+        else:
+            return self._run_stage_submission_safe_v6(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        debug_run.finalize(
+            True,
+            "submission_safe_v15 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v15 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_submission_safe_v16(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "official_task_and_observation_only",
+                "task_key": list(self._task_key(task)),
+                "notes": [
+                    "SFP path reuses the stable submission_safe_v6 legal servo timing",
+                    "SFP then executes a GT-derived module-conditioned canonical pre-insertion primitive",
+                    "The primitive is measured from post-legal-servo to teacher_insert poses and applied in staged chunks",
+                    "SC path matches submission_safe_v6",
+                ],
+            }
+        )
+
+        if task.plug_type == "sfp":
+            send_feedback(
+                "submission_v16: SFP legal servo + structured teacher-derived pre-insertion"
+            )
+            aligned_pose, aligned_observation, aligned_feature = self._run_sfp_submission_servo(
+                initial_observation,
+                get_observation,
+                move_robot,
+                debug_run,
+            )
+            debug_run.save_observation_snapshot(
+                "after_legal_servo",
+                aligned_observation,
+                {
+                    "feature_summary": (
+                        None
+                        if aligned_observation is None
+                        else self._extract_feature_summary(task, aligned_observation)
+                    ),
+                    "feature": aligned_feature,
+                },
+            )
+            if aligned_pose is None or aligned_observation is None:
+                debug_run.finalize(
+                    False,
+                    "submission_v16 SFP servo failed",
+                    aligned_observation,
+                    {"feature_summary": self._extract_feature_summary(task, aligned_observation)},
+                )
+                return False
+
+            structured_pose, structured_observation, structured_metadata = (
+                self._run_sfp_submission_structured_teacher_insert(
+                    task,
+                    aligned_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_structured_preinsert",
+                structured_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(
+                        task, structured_observation
+                    ),
+                    "feature": self._sfp_union_feature(structured_observation),
+                    "structured_metadata": structured_metadata,
+                    "structured_pose": _pose_to_dict(structured_pose),
+                },
+            )
+
+            final_pose, final_observation, insertion_feature = (
+                self._run_sfp_incremental_insertion(
+                    structured_observation
+                    if structured_observation is not None
+                    else aligned_observation,
+                    get_observation,
+                    move_robot,
+                    debug_run,
+                    aligned_feature,
+                )
+            )
+            debug_run.save_observation_snapshot(
+                "after_insertion_cycles",
+                final_observation,
+                {
+                    "feature_summary": self._extract_feature_summary(task, final_observation),
+                    "feature": insertion_feature,
+                    "final_pose": _pose_to_dict(final_pose),
+                },
+            )
+        else:
+            return self._run_stage_submission_safe_v6(
+                task, get_observation, move_robot, send_feedback
+            )
+
+        debug_run.finalize(
+            True,
+            "submission_safe_v16 completed",
+            final_observation,
+            {"feature_summary": self._extract_feature_summary(task, final_observation)},
+        )
+        self.get_logger().info(f"submission_safe_v16 artifacts saved to {debug_run.root}")
+        return True
+
     def _run_stage_submission_safe_v2(
         self,
         task: Task,
@@ -3826,6 +7198,16 @@ class QualPhasePilot(Policy):
         best_pose = start_pose
 
         for lateral_offset in lateral_offsets:
+            debug_run.log_phase(
+                "sfp_force_tool_offset_start",
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    "offset=("
+                    f"{float(lateral_offset[0]):.4f},"
+                    f"{float(lateral_offset[1]):.4f},"
+                    f"{float(lateral_offset[2]):.4f})"
+                ),
+            )
             lateral_pose = self._make_pose(
                 self._pose_position(start_pose) + lateral_offset,
                 quat_wxyz,
@@ -3913,6 +7295,200 @@ class QualPhasePilot(Policy):
                 duration_sec=0.15,
                 debug_run=debug_run,
                 phase_name="force_search_tool_hold",
+            )
+        return best_pose
+
+    def _run_sfp_force_refine_tool_frame(
+        self,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        debug_run: DebugRun,
+        start_pose: Pose,
+        baseline_force_norm: float | None = None,
+    ) -> Pose:
+        if baseline_force_norm is None:
+            baseline_observation = self._wait_for_observation(
+                get_observation, timeout_sec=0.5
+            )
+            baseline_force_norm = self._force_norm(baseline_observation)
+            last_stamp_sec = (
+                None
+                if baseline_observation is None
+                else _stamp_to_float(baseline_observation.center_image.header.stamp)
+            )
+        else:
+            baseline_observation = self._wait_for_observation(
+                get_observation, timeout_sec=0.5
+            )
+            last_stamp_sec = (
+                None
+                if baseline_observation is None
+                else _stamp_to_float(baseline_observation.center_image.header.stamp)
+            )
+
+        quat_wxyz = self._quat_xyzw_to_wxyz(start_pose.orientation)
+        insertion_axis = self._tool_axis_in_base(start_pose, self._SFP_TOOL_INSERTION_AXIS)
+        insertion_axis /= max(np.linalg.norm(insertion_axis), 1e-6)
+
+        reference_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+        if abs(float(np.dot(reference_axis, insertion_axis))) > 0.90:
+            reference_axis = np.array([0.0, 1.0, 0.0], dtype=float)
+        lateral_axis_1 = np.cross(insertion_axis, reference_axis)
+        lateral_axis_1 /= max(np.linalg.norm(lateral_axis_1), 1e-6)
+        lateral_axis_2 = np.cross(insertion_axis, lateral_axis_1)
+        lateral_axis_2 /= max(np.linalg.norm(lateral_axis_2), 1e-6)
+
+        diagonal_axis = lateral_axis_1 + lateral_axis_2
+        diagonal_axis /= max(np.linalg.norm(diagonal_axis), 1e-6)
+        lateral_offsets = [
+            np.array([0.0, 0.0, 0.0], dtype=float),
+            0.0010 * lateral_axis_1,
+            -0.0010 * lateral_axis_1,
+            0.0010 * lateral_axis_2,
+            -0.0010 * lateral_axis_2,
+            0.0012 * diagonal_axis,
+            -0.0012 * diagonal_axis,
+        ]
+        insertion_steps_m = [0.0020, 0.0040, 0.0060, 0.0080, 0.0100]
+        best_pose = start_pose
+
+        for lateral_offset in lateral_offsets:
+            lateral_pose = self._make_pose(
+                self._pose_position(start_pose) + lateral_offset,
+                quat_wxyz,
+            )
+            self._move_for_duration(
+                move_robot,
+                best_pose,
+                lateral_pose,
+                duration_sec=0.18,
+                debug_run=debug_run,
+                phase_name="sfp_force_tool_lateral",
+            )
+            self._hold_pose(
+                move_robot,
+                lateral_pose,
+                duration_sec=0.08,
+                debug_run=debug_run,
+                phase_name="sfp_force_tool_settle",
+            )
+            best_pose = lateral_pose
+            if last_stamp_sec is not None:
+                settle_observation = self._wait_for_observation(
+                    get_observation,
+                    timeout_sec=0.5,
+                    newer_than_sec=last_stamp_sec,
+                )
+                if settle_observation is not None:
+                    last_stamp_sec = _stamp_to_float(
+                        settle_observation.center_image.header.stamp
+                    )
+            else:
+                settle_observation = None
+
+            observed_lateral_pose = self._observed_tcp_pose(
+                settle_observation, lateral_pose
+            )
+            lateral_position = self._pose_position(observed_lateral_pose)
+            for insertion_depth in insertion_steps_m:
+                inserted_pose = self._make_pose(
+                    lateral_position + insertion_depth * insertion_axis,
+                    quat_wxyz,
+                )
+                debug_run.log_phase(
+                    "sfp_force_tool_insert_start",
+                    self.time_now().nanoseconds / 1e9,
+                    note=(
+                        "offset=("
+                        f"{float(lateral_offset[0]):.4f},"
+                        f"{float(lateral_offset[1]):.4f},"
+                        f"{float(lateral_offset[2]):.4f}) "
+                        f"depth={insertion_depth:.4f}"
+                    ),
+                )
+                self._move_for_duration(
+                    move_robot,
+                    best_pose,
+                    inserted_pose,
+                    duration_sec=0.16,
+                    debug_run=debug_run,
+                    phase_name="sfp_force_tool_insert",
+                )
+                self._hold_pose(
+                    move_robot,
+                    inserted_pose,
+                    duration_sec=0.08,
+                    debug_run=debug_run,
+                    phase_name="sfp_force_tool_hold",
+                )
+                observation = self._wait_for_observation(
+                    get_observation,
+                    timeout_sec=0.5,
+                    newer_than_sec=last_stamp_sec,
+                )
+                if observation is not None:
+                    last_stamp_sec = _stamp_to_float(
+                        observation.center_image.header.stamp
+                    )
+                measured_force = self._force_norm(observation)
+                excess_force = measured_force - baseline_force_norm
+                observed_pose = self._observed_tcp_pose(observation, inserted_pose)
+                observed_position = self._pose_position(observed_pose)
+                actual_advance_m = float(
+                    np.dot(observed_position - lateral_position, insertion_axis)
+                )
+                tracking_error_m = None
+                if observation is not None:
+                    tracking_error_m = float(
+                        np.linalg.norm(observation.controller_state.tcp_error[:3])
+                    )
+                debug_run.log_command_sample(
+                    "sfp_force_tool_insert",
+                    inserted_pose,
+                    self.time_now().nanoseconds / 1e9,
+                    note=(
+                        "offset=("
+                        f"{float(lateral_offset[0]):.4f},"
+                        f"{float(lateral_offset[1]):.4f},"
+                        f"{float(lateral_offset[2]):.4f}) "
+                        f"depth={insertion_depth:.4f} "
+                        f"advance={actual_advance_m:.4f} "
+                        f"force={measured_force:.2f} excess={excess_force:.2f} "
+                        f"track={tracking_error_m if tracking_error_m is not None else float('nan'):.4f}"
+                    ),
+                )
+                if excess_force > 8.0 or (
+                    tracking_error_m is not None and tracking_error_m > 0.025
+                ):
+                    debug_run.log_phase(
+                        "sfp_force_tool_insert_abort",
+                        self.time_now().nanoseconds / 1e9,
+                        note=(
+                            f"depth={insertion_depth:.4f} "
+                            f"excess_force={excess_force:.2f} "
+                            f"tracking_error={tracking_error_m if tracking_error_m is not None else float('nan'):.4f}"
+                        ),
+                    )
+                    self._move_for_duration(
+                        move_robot,
+                        inserted_pose,
+                        lateral_pose,
+                        duration_sec=0.14,
+                        debug_run=debug_run,
+                        phase_name="sfp_force_tool_retreat",
+                    )
+                    best_pose = lateral_pose
+                    break
+                best_pose = self._make_pose(observed_position, quat_wxyz)
+            debug_run.log_phase(
+                "sfp_force_tool_offset_done",
+                self.time_now().nanoseconds / 1e9,
+                note=(
+                    "offset=("
+                    f"{float(lateral_offset[0]):.4f},"
+                    f"{float(lateral_offset[1]):.4f},"
+                    f"{float(lateral_offset[2]):.4f})"
+                ),
             )
         return best_pose
 
@@ -5770,12 +9346,68 @@ class QualPhasePilot(Policy):
             return self._run_stage_submission_safe_v8(
                 task, get_observation, move_robot, send_feedback
             )
+        if self._stage == "submission_safe_v9":
+            return self._run_stage_submission_safe_v9(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v10":
+            return self._run_stage_submission_safe_v10(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v11":
+            return self._run_stage_submission_safe_v11(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v12":
+            return self._run_stage_submission_safe_v12(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v13":
+            return self._run_stage_submission_safe_v13(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v14":
+            return self._run_stage_submission_safe_v14(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v15":
+            return self._run_stage_submission_safe_v15(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v16":
+            return self._run_stage_submission_safe_v16(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "submission_safe_v17":
+            return self._run_stage_submission_safe_v17(
+                task, get_observation, move_robot, send_feedback
+            )
         if self._stage == "learn_collect_v0":
             return self._run_stage_learn_collect_v0(
                 task, get_observation, move_robot, send_feedback
             )
         if self._stage == "learn_collect_v1":
             return self._run_stage_learn_collect_v1(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "learn_collect_v2":
+            return self._run_stage_learn_collect_v2(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "learn_collect_sfp_insert_v0":
+            return self._run_stage_learn_collect_sfp_insert_v0(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "learn_collect_sfp_servo_residual_v0":
+            return self._run_stage_learn_collect_sfp_servo_residual_v0(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "learn_collect_sfp_teacher_step_v0":
+            return self._run_stage_learn_collect_sfp_teacher_step_v0(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v0":
+            return self._run_stage_teacher_feasibility_v0(
                 task, get_observation, move_robot, send_feedback
             )
 

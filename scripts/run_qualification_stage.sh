@@ -48,6 +48,7 @@ sleep 20
   export AIC_LEARNED_PORT_DATASET_ROOT="${AIC_LEARNED_PORT_DATASET_ROOT:-}"
   export AIC_LEARNED_PORT_DATASET_SPLIT="${AIC_LEARNED_PORT_DATASET_SPLIT:-train}"
   export AIC_QUAL_LEARNED_SC_MODEL_DIR="${AIC_QUAL_LEARNED_SC_MODEL_DIR:-}"
+  export AIC_QUAL_LEARNED_SFP_MODEL_DIR="${AIC_QUAL_LEARNED_SFP_MODEL_DIR:-}"
   pixi run --as-is ros2 run aic_model aic_model --ros-args -p use_sim_time:=true -p policy:=aic_example_policies.ros.QualPhasePilot
 ) >"$OUT_DIR/model.log" 2>&1 || MODEL_STATUS=$?
 
