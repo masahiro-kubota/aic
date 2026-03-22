@@ -4304,6 +4304,7 @@ class QualPhasePilot(Policy):
         get_observation: GetObservationCallback,
         move_robot: MoveRobotCallback,
         debug_run: DebugRun,
+        teacher_schedule: tuple[tuple[str, float, float, float], ...] | None = None,
     ) -> tuple[Pose | None, Observation | None, dict[str, object]]:
         port_frame = self._port_frame_name(task)
         current_observation: Observation | None = initial_observation
@@ -4313,16 +4314,17 @@ class QualPhasePilot(Policy):
         )
         last_stamp_sec = _stamp_to_float(initial_observation.center_image.header.stamp)
         phase_records: list[dict[str, object]] = []
-        teacher_schedule = (
-            ("teacher_hover", 0.16, 0.38, 0.14),
-            ("teacher_preinsert_far", 0.10, 0.28, 0.10),
-            ("teacher_preinsert_mid", 0.06, 0.24, 0.10),
-            ("teacher_preinsert_near", 0.04, 0.20, 0.08),
-            ("teacher_insert_1", 0.025, 0.18, 0.08),
-            ("teacher_insert_2", 0.015, 0.16, 0.08),
-            ("teacher_insert_3", 0.008, 0.14, 0.08),
-            ("teacher_insert_4", 0.003, 0.12, 0.10),
-        )
+        if teacher_schedule is None:
+            teacher_schedule = (
+                ("teacher_hover", 0.16, 0.38, 0.14),
+                ("teacher_preinsert_far", 0.10, 0.28, 0.10),
+                ("teacher_preinsert_mid", 0.06, 0.24, 0.10),
+                ("teacher_preinsert_near", 0.04, 0.20, 0.08),
+                ("teacher_insert_1", 0.025, 0.18, 0.08),
+                ("teacher_insert_2", 0.015, 0.16, 0.08),
+                ("teacher_insert_3", 0.008, 0.14, 0.08),
+                ("teacher_insert_4", 0.003, 0.12, 0.10),
+            )
 
         for phase_index, (phase_name, z_offset, move_sec, hold_sec) in enumerate(
             teacher_schedule, start=1
@@ -4584,6 +4586,111 @@ class QualPhasePilot(Policy):
             {"feature_summary": self._extract_feature_summary(task, final_observation)},
         )
         self.get_logger().info(f"teacher_feasibility_v0 artifacts saved to {debug_run.root}")
+        return True
+
+    def _run_stage_teacher_feasibility_v1(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        debug_run = DebugRun(self._stage, task)
+        debug_run.log_phase("idle", self.time_now().nanoseconds / 1e9, "task accepted")
+        initial_observation = self._wait_for_observation(get_observation, timeout_sec=5.0)
+        debug_run.save_observation_snapshot(
+            "initial",
+            initial_observation,
+            {"feature_summary": self._extract_feature_summary(task, initial_observation)},
+        )
+        if initial_observation is None:
+            debug_run.finalize(False, "no observation received", None)
+            return False
+        if task.plug_type != "sfp":
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v1 only supports SFP tasks",
+                initial_observation,
+                {"task_key": list(self._task_key(task))},
+            )
+            return False
+
+        debug_run.save_target_metadata(
+            {
+                "provider": "ground_truth_teacher_feasibility_only",
+                "task_key": list(self._task_key(task)),
+                "port_frame": self._port_frame_name(task),
+                "notes": [
+                    "Uses ground-truth port and plug frames to test controller feasibility only",
+                    "This stage is not submission-safe and exists only to gate the teacher route",
+                    "v1 stops at GT pre-insert and hands off to tool-frame force refinement",
+                ],
+            }
+        )
+
+        send_feedback("teacher_feasibility_v1: GT preinsert + tool-frame force refine")
+        preinsert_schedule = (
+            ("teacher_hover", 0.16, 0.38, 0.14),
+            ("teacher_preinsert_far", 0.10, 0.28, 0.10),
+            ("teacher_preinsert_mid", 0.06, 0.24, 0.10),
+            ("teacher_preinsert_near", 0.04, 0.20, 0.08),
+        )
+        teacher_pose, teacher_observation, teacher_metadata = self._run_sfp_gt_teacher_insert(
+            task,
+            initial_observation,
+            get_observation,
+            move_robot,
+            debug_run,
+            teacher_schedule=preinsert_schedule,
+        )
+        debug_run.save_observation_snapshot(
+            "after_gt_preinsert",
+            teacher_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, teacher_observation),
+                "teacher_metadata": teacher_metadata,
+                "teacher_pose": None if teacher_pose is None else _pose_to_dict(teacher_pose),
+            },
+        )
+        if teacher_pose is None or teacher_observation is None:
+            debug_run.finalize(
+                False,
+                "teacher_feasibility_v1 GT preinsert failed",
+                teacher_observation,
+                {"teacher_metadata": teacher_metadata},
+            )
+            return False
+
+        baseline_force_norm = self._force_norm(initial_observation)
+        debug_run.log_phase(
+            "before_force_refine",
+            self.time_now().nanoseconds / 1e9,
+            note=f"baseline_force_norm={baseline_force_norm:.3f}",
+        )
+        final_pose = self._run_sfp_force_refine_tool_frame(
+            get_observation,
+            move_robot,
+            debug_run,
+            start_pose=teacher_pose,
+            baseline_force_norm=baseline_force_norm,
+        )
+        refined_observation = self._wait_for_observation(get_observation, timeout_sec=0.8)
+        debug_run.save_observation_snapshot(
+            "after_force_refine",
+            refined_observation,
+            {
+                "feature_summary": self._extract_feature_summary(task, refined_observation),
+                "final_pose": _pose_to_dict(final_pose),
+                "teacher_metadata": teacher_metadata,
+            },
+        )
+        debug_run.finalize(
+            True,
+            "teacher_feasibility_v1 completed",
+            refined_observation,
+            {"feature_summary": self._extract_feature_summary(task, refined_observation)},
+        )
+        self.get_logger().info(f"teacher_feasibility_v1 artifacts saved to {debug_run.root}")
         return True
 
     def _run_stage_submission_safe_v17(
@@ -9408,6 +9515,10 @@ class QualPhasePilot(Policy):
             )
         if self._stage == "teacher_feasibility_v0":
             return self._run_stage_teacher_feasibility_v0(
+                task, get_observation, move_robot, send_feedback
+            )
+        if self._stage == "teacher_feasibility_v1":
+            return self._run_stage_teacher_feasibility_v1(
                 task, get_observation, move_robot, send_feedback
             )
 

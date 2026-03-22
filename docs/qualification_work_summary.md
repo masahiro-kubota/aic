@@ -418,6 +418,32 @@ acquisition、特に `center_uvz` target representation に集中した。
 
 これは 3 回目の大きな転換点だった。
 
+### T0 v2
+
+次の run では、bag で見えた jam を避けるために、GT teacher を
+`preinsert_near` で止め、その後を tool-frame の force-refine search に置き換えた。
+
+- Score: `70.903064258712277 / 200`
+- trial ごと:
+  - `t1=35.79659943602371`
+  - `t2=35.10646482268856`
+
+この run で分かったこと:
+
+- jerk と excessive force はかなり改善した
+- しかし proximity そのものはむしろ悪化し、`0.07 m` / `0.08 m` で止まった
+- debug timeline では、ほとんどの lateral offset が最初の `2 mm` insertion
+  step で tracking error abort になっていた
+
+これは重要だった。つまり、
+
+- `T0 v0/v1` は「深く行きすぎて jam する」失敗だった
+- `T0 v2` は「早く引き継ぎすぎて shallow のまま abort する」失敗だった
+
+したがって、次の教師再設計で必要なのは pure force search ではなく、
+「GT でより良い pre-insertion まで維持しつつ、stall / tracking error を見て
+progress-gated に recovery する insertion phase」である。
+
 ## 現時点の証拠が実際に示していること
 
 現時点では、いくつかの点について証拠はかなり強い。
@@ -556,6 +582,7 @@ bag metadata の例:
 | `P0` | より大きくバランスした `center_uvz` ゲート | `71.320068644735088 / 200` | `SFP-only` 本線ゲート失敗 |
 | `T0 v0` | randomized GT teacher feasibility | `86.653740214899685 / 200` | GT teacher はまだ挿入主導ではない |
 | `T0 v1` | terminal contact loop 付き GT teacher | `86.562241559624113 / 200` | 意味のある改善なし |
+| `T0 v2` | GT preinsert + tool-frame force refine | `70.903064258712277 / 200` | force は改善したが shallow abort に倒れた |
 
 ## 現時点の判断
 

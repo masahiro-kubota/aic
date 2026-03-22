@@ -414,3 +414,30 @@ It should stay concise enough to scan quickly.
   - `the teacher still stayed proximity-led and therefore still failed the 150 / 200 T0 gate`
 - Next action:
   - `redesign the GT teacher around lower-jerk, axis-aware, recovery-capable near-contact insertion instead of collecting more student labels`
+
+## 2026-03-22 12:49 JST - T0 Randomized SFP GT Teacher Feasibility v2
+
+- Commit: `uncommitted`
+- Milestone: `T0`
+- Submission-safe: `no`
+- Policy / branch: `aic_example_policies.ros.QualPhasePilot`
+- Run config: `AIC_QUAL_STAGE=teacher_feasibility_v1`, same randomized `SFP-only` config `/home/masa/ws_aic_runtime/generated_configs/t0_teacher_sfp_rand2_seed91.yaml`, headless eval via `/entrypoint.sh`, `ground_truth:=true`, `DISPLAY=:1`, GT pre-insert only plus tool-frame force-refine search
+- Score total: `70.903064258712277`
+- Score by trial: `t1=35.79659943602371`, `t2=35.10646482268856`
+- Artifacts:
+  - `/home/masa/aic_results/qual_teacher_feasibility_v1_20260322_124232/eval.log`
+  - `/home/masa/aic_results/qual_teacher_feasibility_v1_20260322_124232/model.log`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_124428_teacher_feasibility_v1_task_1`
+  - `/home/masa/ws_aic_runtime/qualification_debug/20260322_124752_teacher_feasibility_v1_task_1`
+- Notes:
+  - `this run left no copied scoring.yaml because the wrapper hung during teardown after scoring had already been printed; the numeric score above was recovered from eval.log`
+- What worked:
+  - `the new force-refine handoff dramatically reduced jerk and removed the large insertion-force spikes seen in T0 v0/v1`
+  - `the debug timeline now clearly shows which lateral offsets and insertion depths abort on tracking error`
+- What failed:
+  - `the total score regressed sharply from 86.56 / 200 to 70.90 / 200`
+  - `trial_1` ended at `0.07 m` and `trial_2` at `0.08 m`, so GT pre-insert plus pure tool-frame force search was too shallow and too conservative`
+  - `bag/debug evidence showed repeated aborts from tracking error at the first 2 mm insertion step for most offsets, which means the search was starting from a misaligned local frame rather than discovering insertion`
+- Next action:
+  - `do not keep tuning this pure force-search handoff`
+  - `instead, redesign the GT teacher around progress-gated insertion that preserves the stronger GT approach of T0 v0 while using bag-derived stall detection and recovery before student collection`

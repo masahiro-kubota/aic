@@ -1352,6 +1352,12 @@ Current status on 2026-03-22:
 - the first GT-teacher run scored `86.653740214899685 / 200`
 - a second run with an added GT terminal-contact loop scored
   `86.562241559624113 / 200`
+- a third run, `teacher_feasibility_v1`, switched to GT pre-insert followed by
+  tool-frame force refinement and scored only `70.903064258712277 / 200`
+- bag/debug analysis from the failed GT runs shows that the current teacher can
+  get close, but either jams while commanding too-deep reference poses
+  (`T0 v0/v1`) or becomes too conservative and abort-heavy when handed off to a
+  pure force search too early (`T0 v2`)
 
 Interpretation:
 
@@ -1359,6 +1365,9 @@ Interpretation:
 - the current GT teacher also fails the `150 / 200` feasibility gate
 - therefore the next bottleneck is still teacher/controller design, not student
   learning
+- the next T0 redesign should keep the stronger GT approach from `T0 v0` longer
+  and add progress-gated recovery based on observed advance / tracking error,
+  rather than switching immediately to a pure force-search handoff
 
 #### T1. Dense Teacher Dataset
 
