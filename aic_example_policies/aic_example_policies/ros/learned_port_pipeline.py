@@ -68,6 +68,140 @@ def build_center_uvz_target(record: dict[str, Any]) -> np.ndarray:
     return np.array([float(u), float(v), float(z)], dtype=np.float32)
 
 
+def _pose_dict_to_arrays(pose_dict: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    position = pose_dict["position"]
+    orientation = pose_dict["orientation"]
+    return (
+        np.array(
+            [float(position["x"]), float(position["y"]), float(position["z"])],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                float(orientation["x"]),
+                float(orientation["y"]),
+                float(orientation["z"]),
+                float(orientation["w"]),
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
+def _pose_like_to_arrays(pose: Any) -> tuple[np.ndarray, np.ndarray]:
+    if isinstance(pose, dict):
+        return _pose_dict_to_arrays(pose)
+    position = pose.position
+    orientation = pose.orientation
+    return (
+        np.array(
+            [float(position.x), float(position.y), float(position.z)],
+            dtype=np.float32,
+        ),
+        np.array(
+            [
+                float(orientation.x),
+                float(orientation.y),
+                float(orientation.z),
+                float(orientation.w),
+            ],
+            dtype=np.float32,
+        ),
+    )
+
+
+def _quat_xyzw_to_rotation_matrix(quat_xyzw: np.ndarray) -> np.ndarray:
+    x, y, z, w = [float(value) for value in quat_xyzw]
+    norm = x * x + y * y + z * z + w * w
+    if norm < 1e-9:
+        return np.eye(3, dtype=np.float32)
+    scale = 2.0 / norm
+    xx, yy, zz = x * x * scale, y * y * scale, z * z * scale
+    xy, xz, yz = x * y * scale, x * z * scale, y * z * scale
+    wx, wy, wz = w * x * scale, w * y * scale, w * z * scale
+    return np.array(
+        [
+            [1.0 - (yy + zz), xy - wz, xz + wy],
+            [xy + wz, 1.0 - (xx + zz), yz - wx],
+            [xz - wy, yz + wx, 1.0 - (xx + yy)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _rotation_matrix_to_rotvec(rotation: np.ndarray) -> np.ndarray:
+    trace = float(np.trace(rotation))
+    angle = float(np.arccos(np.clip((trace - 1.0) * 0.5, -1.0, 1.0)))
+    if angle < 1e-8:
+        return np.zeros(3, dtype=np.float32)
+    axis = np.array(
+        [
+            rotation[2, 1] - rotation[1, 2],
+            rotation[0, 2] - rotation[2, 0],
+            rotation[1, 0] - rotation[0, 1],
+        ],
+        dtype=np.float32,
+    )
+    axis /= max(2.0 * np.sin(angle), 1e-6)
+    return axis * angle
+
+
+def build_teacher_insert_delta_target(record: dict[str, Any]) -> np.ndarray:
+    labels = record["labels"]
+    teacher_pose = labels.get("teacher_insert_pose")
+    current_pose = labels.get("current_tcp_pose")
+    if teacher_pose is None or current_pose is None:
+        raise KeyError("teacher_insert_pose/current_tcp_pose")
+    teacher_position, teacher_quat = _pose_dict_to_arrays(teacher_pose)
+    current_position, current_quat = _pose_dict_to_arrays(current_pose)
+    translation_delta = teacher_position - current_position
+    teacher_rotation = _quat_xyzw_to_rotation_matrix(teacher_quat)
+    current_rotation = _quat_xyzw_to_rotation_matrix(current_quat)
+    rotation_delta = teacher_rotation @ current_rotation.T
+    rotvec = _rotation_matrix_to_rotvec(rotation_delta)
+    return np.concatenate([translation_delta, rotvec], axis=0).astype(np.float32)
+
+
+def build_teacher_step_delta_target(record: dict[str, Any]) -> np.ndarray:
+    labels = record["labels"]
+    teacher_pose = labels.get("teacher_step_pose")
+    current_pose = labels.get("current_tcp_pose")
+    if teacher_pose is None or current_pose is None:
+        raise KeyError("teacher_step_pose/current_tcp_pose")
+    teacher_position, teacher_quat = _pose_dict_to_arrays(teacher_pose)
+    current_position, current_quat = _pose_dict_to_arrays(current_pose)
+    translation_delta = teacher_position - current_position
+    teacher_rotation = _quat_xyzw_to_rotation_matrix(teacher_quat)
+    current_rotation = _quat_xyzw_to_rotation_matrix(current_quat)
+    rotation_delta = teacher_rotation @ current_rotation.T
+    rotvec = _rotation_matrix_to_rotvec(rotation_delta)
+    return np.concatenate([translation_delta, rotvec], axis=0).astype(np.float32)
+
+
+def build_target(record: dict[str, Any], target_kind: str) -> np.ndarray:
+    if target_kind == "center_uvz":
+        return build_center_uvz_target(record)
+    if target_kind == "teacher_insert_delta6":
+        return build_teacher_insert_delta_target(record)
+    if target_kind == "teacher_step_delta6":
+        return build_teacher_step_delta_target(record)
+    raise ValueError(f"unsupported target_kind: {target_kind}")
+
+
+def target_dim(target_kind: str) -> int:
+    return int(build_target_dummy(target_kind).shape[0])
+
+
+def build_target_dummy(target_kind: str) -> np.ndarray:
+    if target_kind == "center_uvz":
+        return np.zeros(3, dtype=np.float32)
+    if target_kind == "teacher_insert_delta6":
+        return np.zeros(6, dtype=np.float32)
+    if target_kind == "teacher_step_delta6":
+        return np.zeros(6, dtype=np.float32)
+    raise ValueError(f"unsupported target_kind: {target_kind}")
+
+
 def uvz_to_point_optical(uvz: np.ndarray, camera_info_k: list[float]) -> np.ndarray:
     fx = float(camera_info_k[0])
     fy = float(camera_info_k[4])
@@ -77,6 +211,64 @@ def uvz_to_point_optical(uvz: np.ndarray, camera_info_k: list[float]) -> np.ndar
     x = (u - cx) * depth / max(fx, 1e-6)
     y = (v - cy) * depth / max(fy, 1e-6)
     return np.array([x, y, depth], dtype=np.float32)
+
+
+def build_runtime_aux_vector(
+    current_pose: Any,
+    feature_summary: dict[str, Any] | None,
+    step_index: int = 1,
+    max_steps: int = 8,
+) -> np.ndarray:
+    position, quat_xyzw = _pose_like_to_arrays(current_pose)
+    image_shape = (
+        list(feature_summary.get("image_shape", [1152, 1024]))
+        if isinstance(feature_summary, dict)
+        else [1152, 1024]
+    )
+    image_width = max(float(image_shape[0]), 1.0)
+    image_height = max(float(image_shape[1]), 1.0)
+    center_camera = (
+        feature_summary.get("center_camera", {})
+        if isinstance(feature_summary, dict)
+        else {}
+    )
+    union_bbox = center_camera.get("union_bbox_xywh")
+    if union_bbox is not None and len(union_bbox) == 4:
+        x, y, width, height = [float(value) for value in union_bbox]
+        center_u = x + width * 0.5
+        center_v = y + height * 0.5
+        feature_values = np.array(
+            [
+                1.0,
+                (center_u / image_width) * 2.0 - 1.0,
+                (center_v / image_height) * 2.0 - 1.0,
+                width / image_width,
+                height / image_height,
+                min(float(center_camera.get("component_count", 0)) / 20.0, 1.0),
+            ],
+            dtype=np.float32,
+        )
+    else:
+        feature_values = np.zeros(6, dtype=np.float32)
+    step_fraction = float(max(step_index - 1, 0)) / float(max(max_steps - 1, 1))
+    return np.concatenate(
+        [position.astype(np.float32), quat_xyzw.astype(np.float32), feature_values, np.array([step_fraction], dtype=np.float32)],
+        axis=0,
+    ).astype(np.float32)
+
+
+def build_aux_target(record: dict[str, Any]) -> np.ndarray:
+    labels = record["labels"]
+    extra = record.get("extra", {})
+    current_pose = labels.get("current_tcp_pose")
+    if current_pose is None:
+        raise KeyError("current_tcp_pose")
+    step_index = int(extra.get("teacher_step_index", 1))
+    return build_runtime_aux_vector(
+        current_pose=current_pose,
+        feature_summary=extra.get("feature_summary"),
+        step_index=step_index,
+    )
 
 
 @dataclass
@@ -209,9 +401,11 @@ class PortPointDataset(Dataset):
         dataset_root: str | Path,
         vocabulary: TaskVocabulary,
         normalizer: TargetNormalizer,
+        aux_normalizer: TargetNormalizer | None = None,
         image_size: int = 224,
         records: list[dict[str, Any]] | None = None,
         plug_type_filter: str | None = None,
+        target_kind: str = "center_uvz",
     ) -> None:
         self.root = _as_path(dataset_root)
         loaded_records = (
@@ -228,7 +422,9 @@ class PortPointDataset(Dataset):
         self.records = loaded_records
         self.vocabulary = vocabulary
         self.normalizer = normalizer
+        self.aux_normalizer = aux_normalizer
         self.image_size = int(image_size)
+        self.target_kind = target_kind
 
     def __len__(self) -> int:
         return len(self.records)
@@ -245,8 +441,14 @@ class PortPointDataset(Dataset):
 
         task_fields = _task_field_dict(record["task"])
         task_indices = self.vocabulary.encode(task_fields)
-        target_uvz = build_center_uvz_target(record)
-        normalized_target = self.normalizer.normalize(target_uvz)
+        target_value = build_target(record, self.target_kind)
+        normalized_target = self.normalizer.normalize(target_value)
+        aux_value = build_aux_target(record)
+        normalized_aux = (
+            self.aux_normalizer.normalize(aux_value)
+            if self.aux_normalizer is not None
+            else aux_value
+        )
         return {
             "left": images["left"],
             "center": images["center"],
@@ -256,7 +458,9 @@ class PortPointDataset(Dataset):
                 for key, value in task_indices.items()
             },
             "target": torch.tensor(normalized_target, dtype=torch.float32),
-            "raw_target": torch.tensor(target_uvz, dtype=torch.float32),
+            "raw_target": torch.tensor(target_value, dtype=torch.float32),
+            "aux": torch.tensor(normalized_aux, dtype=torch.float32),
+            "raw_aux": torch.tensor(aux_value, dtype=torch.float32),
             "record": record,
         }
 
@@ -292,21 +496,24 @@ class MultiViewPortPointRegressor(nn.Module):
         target_module_vocab_size: int,
         port_name_vocab_size: int,
         embedding_dim: int = 8,
+        output_dim: int = 3,
+        aux_dim: int = 0,
     ) -> None:
         super().__init__()
         self.encoder = _SharedImageEncoder()
+        self.aux_dim = int(aux_dim)
         self.plug_embedding = nn.Embedding(plug_vocab_size, embedding_dim)
         self.target_module_embedding = nn.Embedding(
             target_module_vocab_size, embedding_dim
         )
         self.port_name_embedding = nn.Embedding(port_name_vocab_size, embedding_dim)
-        feature_dim = 3 * 128 + 3 * embedding_dim
+        feature_dim = 3 * 128 + 3 * embedding_dim + self.aux_dim
         self.head = nn.Sequential(
             nn.Linear(feature_dim, 256),
             nn.ReLU(inplace=True),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 3),
+            nn.Linear(128, output_dim),
         )
 
     def forward(
@@ -317,6 +524,7 @@ class MultiViewPortPointRegressor(nn.Module):
         plug_type: torch.Tensor,
         target_module_name: torch.Tensor,
         port_name: torch.Tensor,
+        aux: torch.Tensor | None = None,
     ) -> torch.Tensor:
         left_features = self.encoder(left)
         center_features = self.encoder(center)
@@ -329,35 +537,52 @@ class MultiViewPortPointRegressor(nn.Module):
             ],
             dim=1,
         )
+        aux_features = (
+            aux
+            if self.aux_dim > 0 and aux is not None
+            else left_features.new_zeros((left_features.shape[0], self.aux_dim))
+        )
         return self.head(
             torch.cat(
-                [left_features, center_features, right_features, task_features], dim=1
+                [left_features, center_features, right_features, task_features, aux_features], dim=1
             )
         )
 
 
-def build_model_from_vocabulary(vocabulary: TaskVocabulary) -> MultiViewPortPointRegressor:
+def build_model_from_vocabulary(
+    vocabulary: TaskVocabulary, output_dim: int = 3, aux_dim: int = 0
+) -> MultiViewPortPointRegressor:
     return MultiViewPortPointRegressor(
         plug_vocab_size=len(vocabulary.plug_type_to_idx),
         target_module_vocab_size=len(vocabulary.target_module_name_to_idx),
         port_name_vocab_size=len(vocabulary.port_name_to_idx),
+        output_dim=output_dim,
+        aux_dim=aux_dim,
     )
 
 
 class LearnedPortInference:
+    manifest: dict[str, Any]
+
     def __init__(
         self,
         model: MultiViewPortPointRegressor,
         vocabulary: TaskVocabulary,
         normalizer: TargetNormalizer,
+        aux_normalizer: TargetNormalizer | None,
         image_size: int,
         device: torch.device,
+        manifest: dict[str, Any],
     ) -> None:
         self.model = model.eval()
         self.vocabulary = vocabulary
         self.normalizer = normalizer
+        self.aux_normalizer = aux_normalizer
         self.image_size = int(image_size)
         self.device = device
+        self.manifest: dict[str, Any] = manifest
+        self.target_kind = str(manifest.get("target_kind", "center_uvz"))
+        self.aux_dim = int(manifest.get("aux_dim", 0))
 
     @classmethod
     def load(
@@ -369,12 +594,22 @@ class LearnedPortInference:
         manifest = json.loads((artifact_root / "manifest.json").read_text())
         vocabulary = TaskVocabulary.from_dict(manifest["vocabulary"])
         normalizer = TargetNormalizer.from_dict(manifest["target_normalizer"])
+        aux_normalizer = (
+            TargetNormalizer.from_dict(manifest["aux_normalizer"])
+            if manifest.get("aux_normalizer") is not None
+            else None
+        )
         resolved_device = (
             torch.device(device)
             if device is not None
             else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         )
-        model = build_model_from_vocabulary(vocabulary)
+        output_dim = int(manifest.get("output_dim", 3))
+        model = build_model_from_vocabulary(
+            vocabulary,
+            output_dim=output_dim,
+            aux_dim=int(manifest.get("aux_dim", 0)),
+        )
         state_dict = torch.load(
             artifact_root / "best_model.pt",
             map_location=resolved_device,
@@ -386,18 +621,35 @@ class LearnedPortInference:
             model=model,
             vocabulary=vocabulary,
             normalizer=normalizer,
+            aux_normalizer=aux_normalizer,
             image_size=int(manifest["image_size"]),
             device=resolved_device,
+            manifest=manifest,
         )
 
-    def predict_center_uvz(
+    def predict_target_vector(
         self,
         task: Any,
         images_bgr: dict[str, np.ndarray],
-        center_camera_k: list[float],
+        aux_vector: np.ndarray | None = None,
     ) -> dict[str, Any]:
         task_fields = _task_field_dict(task)
         task_indices = self.vocabulary.encode(task_fields)
+        if self.aux_dim > 0:
+            if aux_vector is None:
+                aux_vector = np.zeros(self.aux_dim, dtype=np.float32)
+            normalized_aux = (
+                self.aux_normalizer.normalize(aux_vector)
+                if self.aux_normalizer is not None
+                else aux_vector
+            )
+            aux_tensor = (
+                torch.from_numpy(np.asarray(normalized_aux, dtype=np.float32))
+                .unsqueeze(0)
+                .to(self.device)
+            )
+        else:
+            aux_tensor = None
         with torch.no_grad():
             left = (
                 _encode_image(images_bgr["left"], self.image_size)
@@ -429,12 +681,35 @@ class LearnedPortInference:
                 port_name=torch.tensor(
                     [task_indices["port_name"]], dtype=torch.long, device=self.device
                 ),
+                aux=aux_tensor,
             )
         normalized = output.squeeze(0).detach().cpu().numpy().astype(np.float32)
-        uvz = self.normalizer.denormalize(normalized)
-        point_optical = uvz_to_point_optical(uvz, center_camera_k)
         return {
             "task_fields": task_fields,
+            "target_kind": self.target_kind,
+            "vector": [
+                float(value) for value in self.normalizer.denormalize(normalized)
+            ],
+        }
+
+    def predict_center_uvz(
+        self,
+        task: Any,
+        images_bgr: dict[str, np.ndarray],
+        center_camera_k: list[float],
+        aux_vector: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        prediction = self.predict_target_vector(
+            task, images_bgr, aux_vector=aux_vector
+        )
+        if prediction["target_kind"] != "center_uvz":
+            raise ValueError(
+                f"model target_kind is {prediction['target_kind']}, not center_uvz"
+            )
+        uvz = np.array(prediction["vector"], dtype=np.float32)
+        point_optical = uvz_to_point_optical(uvz, center_camera_k)
+        return {
+            "task_fields": prediction["task_fields"],
             "center_uvz": [float(value) for value in uvz],
             "point_center_optical": [float(value) for value in point_optical],
         }
