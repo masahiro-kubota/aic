@@ -3,11 +3,3 @@ services:
     image: my-solution:submission-safe-v7
     build:
       dockerfile: docker/submission_safe_v7/Dockerfile
-      context: ..
-    environment:
-      RMW_IMPLEMENTATION: rmw_zenoh_cpp
-      ZENOH_ROUTER_CHECK_ATTEMPTS: -1
-      AIC_ROUTER_ADDR: eval:7447
-      AIC_MODEL_PASSWD: CHANGE_IN_PROD
-      AIC_QUAL_STAGE: submission_safe_v7
-      AIC_QUAL_LEARNED_SC_MODEL_DIR: /opt/aic_models/sc_uvz_v1
