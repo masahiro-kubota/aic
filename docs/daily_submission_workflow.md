@@ -17,6 +17,10 @@ This file is narrower and more practical:
 
 The goal is to make the daily workflow boring, repeatable, and auditable.
 
+For a compact answer to "what was the last submission packaging version we
+actually used?", see
+[submission_packaging_history.md](/home/masa/ws_aic/src/aic/docs/submission_packaging_history.md).
+
 ## Design Principles
 
 The workflow should optimize for the following:
