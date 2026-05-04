@@ -287,7 +287,7 @@ Use a tag that encodes both date and commit.
 Recommended format:
 
 ```text
-YYYYMMDD-<stage>-<gitsha>
+<stage>-<shortsha>-<YYYYMMDD-HHMMSS>
 ```
 
 Example:
@@ -296,7 +296,8 @@ Example:
 submission-safe-v7-bc3e493-20260323-040153
 ```
 
-This makes it easy to trace a portal submission back to the source state.
+This keeps the stage visible first, while still making it easy to trace a
+portal submission back to the exact source state and packaging time.
 
 ### Step 11. Push to ECR
 
@@ -305,14 +306,25 @@ Follow [submission.md](/home/masa/ws_aic/src/aic/docs/submission.md).
 High-level flow:
 
 ```bash
-aws configure --profile <team_slug>
-export AWS_PROFILE=<team_slug>
+aws configure --profile masapon
+export AWS_PROFILE=masapon
+TAG="submission-safe-v7-$(git rev-parse --short HEAD)-$(date +%Y%m%d-%H%M%S)"
 aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 973918476471.dkr.ecr.us-east-1.amazonaws.com
-docker tag <local-image> 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/<team_slug>:<tag>
-docker push 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/<team_slug>:<tag>
+docker tag <local-image> 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/masapon:$TAG
+docker push 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/masapon:$TAG
+aws ecr describe-images \
+  --region us-east-1 \
+  --repository-name aic-team/masapon \
+  --image-ids imageTag=$TAG \
+  --query 'imageDetails[0].[imageTags[0],imageDigest,imagePushedAt,imageStatus]' \
+  --output table
 ```
 
 Do not reuse an existing tag. The registry is immutable.
+
+Before registering the URI in the portal, confirm that the pushed image is
+visible in ECR and has status `ACTIVE`. Record the returned digest and push
+timestamp alongside the submission log.
 
 ### Step 12. Register in the Portal
 
