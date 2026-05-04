@@ -9,43 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-
-
-def _load_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    if not isinstance(data, dict):
-        raise TypeError(f"Expected mapping YAML at {path}")
-    return data
-
-
-def _uniform(rng: random.Random, lo: float, hi: float) -> float:
-    return float(rng.uniform(lo, hi))
-
-
-def _set_false_rails(task_board: dict[str, Any], prefix: str, count: int) -> None:
-    for idx in range(count):
-        key = f"{prefix}_{idx}"
-        if key in task_board:
-            task_board[key]["entity_present"] = False
-
-
-def _randomize_entity_translation(
-    rng: random.Random,
-    rail_node: dict[str, Any],
-    lo: float,
-    hi: float,
-) -> None:
-    rail_node.setdefault(
-        "entity_pose",
-        {
-            "translation": 0.0,
-            "roll": 0.0,
-            "pitch": 0.0,
-            "yaw": 0.0,
-        },
-    )
-    rail_node["entity_pose"]["translation"] = _uniform(rng, lo, hi)
+from qualification_randomization import (
+    load_yaml,
+    randomize_entity_translation,
+    set_false_rails,
+    uniform,
+)
 
 
 def _build_trial(
@@ -67,15 +36,15 @@ def _build_trial(
     task = trial["tasks"]["task_1"]
     cable_pose = trial["scene"]["cables"]["cable_0"]["pose"]
 
-    task_board["pose"]["x"] = _uniform(rng, *board_x_range)
-    task_board["pose"]["y"] = _uniform(rng, *board_y_range)
-    task_board["pose"]["yaw"] = _uniform(rng, *board_yaw_range)
+    task_board["pose"]["x"] = uniform(rng, *board_x_range)
+    task_board["pose"]["y"] = uniform(rng, *board_y_range)
+    task_board["pose"]["yaw"] = uniform(rng, *board_yaw_range)
 
     nic_limits = limits["nic_rail"]
     sc_limits = limits["sc_rail"]
     mount_limits = limits["mount_rail"]
 
-    _set_false_rails(task_board, "nic_rail", 5)
+    set_false_rails(task_board, "nic_rail", 5)
     target_rail = forced_target_rail if forced_target_rail is not None else rng.randrange(5)
     remaining_rails = [idx for idx in range(5) if idx != target_rail]
     extra_count = min(extra_nics_max, len(remaining_rails))
@@ -98,20 +67,20 @@ def _build_trial(
                 "yaw": 0.0,
             },
         )
-        rail["entity_pose"]["translation"] = _uniform(
+        rail["entity_pose"]["translation"] = uniform(
             rng,
             nic_limits["min_translation"],
             nic_limits["max_translation"],
         )
         rail["entity_pose"]["roll"] = 0.0
         rail["entity_pose"]["pitch"] = 0.0
-        rail["entity_pose"]["yaw"] = _uniform(rng, -nic_yaw_abs_max, nic_yaw_abs_max)
+        rail["entity_pose"]["yaw"] = uniform(rng, -nic_yaw_abs_max, nic_yaw_abs_max)
 
     task["target_module_name"] = f"nic_card_mount_{target_rail}"
 
     for sc_key in ("sc_rail_0", "sc_rail_1"):
         if sc_key in task_board and task_board[sc_key]["entity_present"]:
-            _randomize_entity_translation(
+            randomize_entity_translation(
                 rng,
                 task_board[sc_key],
                 sc_limits["min_translation"],
@@ -128,7 +97,7 @@ def _build_trial(
         "sc_mount_rail_1",
     ):
         if mount_key in task_board and task_board[mount_key]["entity_present"]:
-            _randomize_entity_translation(
+            randomize_entity_translation(
                 rng,
                 task_board[mount_key],
                 mount_limits["min_translation"],
@@ -136,16 +105,16 @@ def _build_trial(
             )
 
     base_z = rng.choice((0.04245, 0.04545))
-    cable_pose["gripper_offset"]["x"] = _uniform(rng, -grasp_pos_noise, grasp_pos_noise)
-    cable_pose["gripper_offset"]["y"] = 0.015385 + _uniform(
+    cable_pose["gripper_offset"]["x"] = uniform(rng, -grasp_pos_noise, grasp_pos_noise)
+    cable_pose["gripper_offset"]["y"] = 0.015385 + uniform(
         rng, -grasp_pos_noise, grasp_pos_noise
     )
-    cable_pose["gripper_offset"]["z"] = base_z + _uniform(
+    cable_pose["gripper_offset"]["z"] = base_z + uniform(
         rng, -grasp_pos_noise, grasp_pos_noise
     )
-    cable_pose["roll"] = 0.4432 + _uniform(rng, -grasp_rot_noise, grasp_rot_noise)
-    cable_pose["pitch"] = -0.4838 + _uniform(rng, -grasp_rot_noise, grasp_rot_noise)
-    cable_pose["yaw"] = 1.3303 + _uniform(rng, -grasp_rot_noise, grasp_rot_noise)
+    cable_pose["roll"] = 0.4432 + uniform(rng, -grasp_rot_noise, grasp_rot_noise)
+    cable_pose["pitch"] = -0.4838 + uniform(rng, -grasp_rot_noise, grasp_rot_noise)
+    cable_pose["yaw"] = 1.3303 + uniform(rng, -grasp_rot_noise, grasp_rot_noise)
 
     trial["metadata"] = {
         "generated_by": "generate_randomized_sfp_config.py",
@@ -194,7 +163,7 @@ def main() -> None:
         raise ValueError("--num-trials must be positive")
 
     rng = random.Random(args.seed)
-    template = _load_yaml(args.template)
+    template = load_yaml(args.template)
     limits = template["task_board_limits"]
     base_trial = template["trials"]["trial_1"]
 

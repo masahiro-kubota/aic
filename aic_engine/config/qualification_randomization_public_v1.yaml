@@ -1,0 +1,51 @@
+# Public-spec approximation for local qualification randomization.
+# This profile intentionally stays within documented rail limits and uses
+# explicit board pose ranges so a fixed seed can reproduce the same YAML.
+#
+# Trial 1/2 board ranges are inherited from the existing SFP randomization
+# helper in this repository.
+# Trial 3 board ranges are a conservative public approximation centered around
+# sample_config.yaml so the target remains near the camera frustum.
+
+profile_name: qualification_randomization_public_v1
+template: aic_engine/config/sample_config.yaml
+
+grasp_noise:
+  position_abs_max: 0.002
+  rotation_abs_max: 0.04
+
+mount_randomization:
+  translation_only: true
+
+trial_1_2:
+  board_pose:
+    x:
+      min: 0.145
+      max: 0.175
+    y:
+      min: -0.2
+      max: -0.02
+    yaw:
+      min: 3.0
+      max: 3.15
+  target_ports:
+    - sfp_port_0
+    - sfp_port_1
+  extra_nics_max: 2
+  nic_yaw_abs_max: 0.17453292519943295
+
+trial_3:
+  board_pose:
+    x:
+      min: 0.155
+      max: 0.185
+    y:
+      min: -0.04
+      max: 0.08
+    yaw:
+      min: 2.94
+      max: 3.08
+  target_ports:
+    - sc_port_0
+    - sc_port_1
+  other_sc_port_present_probability: 0.5
